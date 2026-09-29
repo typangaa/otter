@@ -848,6 +848,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "libc",
  "predicates",
  "serde",
  "serde_json",

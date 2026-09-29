@@ -241,6 +241,14 @@ Inference commands:
   workflow run <NAME> --backend B   Override the backend list (repeat); also
                                     --step/--generator/--evaluator/--judge/--synthesizer
 
+GPU slot leases (no weir.toml needed):
+  lease run --slot NAME=REPLICA \
+    [--slot NAME=REPLICA]...        Acquire a free slot, run CMD under the lease
+    [--affinity KEY]
+    [--wait-timeout SECS]
+    -- <CMD> [ARGS]...
+  lease status [--json]             List every known slot: held / free (+ record)
+
 Config management:
   validate                          Validate weir.toml and exit
   backend list                      List configured backends
@@ -258,6 +266,44 @@ Config management:
   version                           Print version info
   schema                            Print JSON Schema for weir.toml
 ```
+
+## GPU slot leases
+
+`weir lease` gates commands that need an exclusive GPU (or one replica of a
+model server). It is independent of `weir.toml` — no config file is read.
+
+```sh
+weir lease run --slot gpu-a=a --slot gpu-b=b -- pi-worker -b {replica} -t 900 <worktree> <prompt.md>
+weir lease status          # gpu-a  held  pid=123 replica=a command=pi-worker -b a …
+weir lease status --json   # [{"slot":"gpu-a","state":"held","record":{…}}, …]
+```
+
+- **Slots.** Each `--slot NAME=REPLICA` is one mutually-exclusive slot. weir
+  tries them in the order given (`--affinity KEY` first prefers the slot that
+  last served `KEY`), taking a non-blocking `flock(2)`; if every slot is busy it
+  polls every 250 ms. `--wait-timeout SECS` bounds that wait — on expiry weir
+  prints to stderr and exits **75** (`EX_TEMPFAIL`); the default is to wait
+  forever.
+- **`{replica}`** is replaced in every argument with the replica of the slot that
+  won, so one command line fans out over N replicas.
+- **Allowed commands.** Only an executable whose basename is exactly `pi-worker`
+  or `agy-worker` may take a lease. Anything else fails with exit **2** before a
+  lock file is even created. This list is hard-coded, not configurable. The
+  check inspects the command **basename only**, so callers must ensure the
+  resolved executable comes from a trusted location (i.e. via `PATH`).
+- **State.** Lock files live in
+  `${XDG_STATE_HOME:-$HOME/.local/state}/weir/leases/<NAME>.lock` (a slot shows
+  up in `lease status` once its file exists, i.e. after its first `lease run`);
+  affinity state in `.../weir/affinity.json`. Set `WEIR_STATE_DIR` to relocate
+  the whole state root (`$WEIR_STATE_DIR/leases`, `$WEIR_STATE_DIR/affinity.json`).
+  Each lock file holds a JSON record of the current holder
+  (`slot`, `replica`, `pid`, `command`, `started_at`).
+- **Cleanup.** The child runs in its own process group; `flock` releases the slot
+  even if weir is killed, and a SIGINT/SIGTERM sent to weir is forwarded to the
+  child's process group (SIGKILL after 10 s if it survives). weir exits with the
+  child's exit code (`128+signal` if it died on a signal) and prints exactly one
+  summary line to stderr:
+  `weir lease: slot=gpu-a replica=a queue_wait_ms=0 elapsed_ms=90412 exit=0`.
 
 ## Observability
 

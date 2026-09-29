@@ -27,6 +27,7 @@ mod cli;
 mod config;
 mod engine;
 mod error;
+mod lease;
 mod observability;
 mod resilience;
 
@@ -106,6 +107,28 @@ enum Command {
     /// Example:
     ///   weir chat agy "Summarise this file: $(cat notes.txt)"
     Chat(ChatArgs),
+
+    /// GPU slot leases — run a command under an exclusive flock-based slot,
+    /// or report which slots are held.
+    ///
+    /// Neither subcommand reads weir.toml. Only commands named `pi-worker` or
+    /// `agy-worker` may take a lease; `{replica}` in the args is replaced by the
+    /// replica of the slot that was acquired.
+    ///
+    /// Example:
+    ///   weir lease run --slot gpu-a=a --slot gpu-b=b -- pi-worker -b {replica} wt notes.md
+    #[command(subcommand)]
+    Lease(LeaseCommand),
+}
+
+/// `weir lease …` subcommands.
+#[derive(Debug, Subcommand)]
+enum LeaseCommand {
+    /// Acquire a slot lease and run the command under it.
+    Run(lease::LeaseRunArgs),
+
+    /// Show which slots are held and which are free.
+    Status(lease::LeaseStatusArgs),
 }
 
 // ── backend subcommands ───────────────────────────────────────────────────────
@@ -561,6 +584,10 @@ async fn dispatch(
                 exit_code_for(&e)
             }
         },
+
+        // ── lease (never touches weir.toml) ───────────────────────────────────
+        Command::Lease(LeaseCommand::Run(args)) => lease::run(args).await,
+        Command::Lease(LeaseCommand::Status(args)) => lease::status(json || args.json_flag()),
 
         // ── version ───────────────────────────────────────────────────────────
         Command::Version => {
