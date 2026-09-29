@@ -59,9 +59,26 @@ impl StdioCliBackend {
         let mut result: Vec<String> = Vec::with_capacity(self.args_template.len());
 
         for tmpl in &self.args_template {
-            let expanded = tmpl
-                .replace("{prompt}", prompt_text)
-                .replace("{model}", model_str);
+            // Single pass: scan the template once and substitute placeholders.
+            // Substituted text (e.g. the user prompt) is never re-scanned, so a
+            // literal "{model}" inside the prompt is passed through unchanged.
+            let mut expanded = String::with_capacity(tmpl.len());
+            let mut rest = tmpl.as_str();
+            loop {
+                let next = match (rest.find("{prompt}"), rest.find("{model}")) {
+                    (Some(p), Some(m)) if p < m => Some((p, "{prompt}", prompt_text)),
+                    (Some(p), None) => Some((p, "{prompt}", prompt_text)),
+                    (_, Some(m)) => Some((m, "{model}", model_str)),
+                    (None, None) => None,
+                };
+                let Some((idx, token, value)) = next else {
+                    break;
+                };
+                expanded.push_str(&rest[..idx]);
+                expanded.push_str(value);
+                rest = &rest[idx + token.len()..];
+            }
+            expanded.push_str(rest);
 
             if expanded.is_empty() && tmpl.contains("{model}") {
                 // Drop the preceding flag (e.g. "-m") together with this arg.
@@ -75,8 +92,11 @@ impl StdioCliBackend {
 
     /// Debug-safe version of `build_args`: truncates long prompt values.
     fn debug_args(&self, prompt_text: &str, model: Option<&str>) -> Vec<String> {
-        let display_prompt = if prompt_text.len() > 200 {
-            format!("{}…[{} chars]", &prompt_text[..200], prompt_text.len())
+        // Truncate by chars, never bytes: byte slicing panics mid multi-byte
+        // character (CJK, Vietnamese, emoji).
+        let display_prompt: String = if prompt_text.chars().count() > 200 {
+            let head: String = prompt_text.chars().take(200).collect();
+            format!("{}…[{} chars]", head, prompt_text.chars().count())
         } else {
             prompt_text.to_string()
         };
@@ -105,11 +125,17 @@ impl Backend for StdioCliBackend {
         let model = req.model.as_deref().or(self.default_model.as_deref());
         let args = self.build_args(prompt, model);
 
+        // Only build the (possibly large) debug string when DEBUG is enabled.
+        let debug_args = if tracing::enabled!(tracing::Level::DEBUG) {
+            Some(self.debug_args(prompt, model))
+        } else {
+            None
+        };
         debug!(
             backend  = %self.name,
             command  = %self.command,
             model    = ?model,
-            args     = ?self.debug_args(prompt, model),
+            args     = ?debug_args,
             "spawning cli for chat"
         );
 
@@ -245,5 +271,84 @@ mod tests {
         };
         let err = backend.chat(req).await.unwrap_err();
         assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    fn make_backend(args: Vec<&str>) -> StdioCliBackend {
+        let cfg = BackendConfig {
+            name: "test".to_string(),
+            kind: BackendKind::StdioCli {
+                command: "true".to_string(),
+                args: args.into_iter().map(String::from).collect(),
+            },
+            timeout_secs: 5,
+            default_model: None,
+            retry_attempts: None,
+            failure_threshold: None,
+            recovery_secs: None,
+            rate_limit_rps: None,
+        };
+        StdioCliBackend::new(&cfg).unwrap()
+    }
+
+    #[test]
+    fn debug_args_truncates_cjk_prompt_by_chars_without_panicking() {
+        let backend = make_backend(vec!["{prompt}"]);
+        let cjk: String = std::iter::repeat_n('世', 300).collect();
+        let args = backend.debug_args(&cjk, None);
+        let out = &args[0];
+        assert!(out.contains('…'), "expected ellipsis, got: {out}");
+        // The prompt portion is at most 200 chars plus the ellipsis/marker.
+        let head = out.split('…').next().unwrap();
+        assert_eq!(head.chars().count(), 200);
+        assert!(head.chars().all(|c| c == '世'));
+    }
+
+    #[test]
+    fn build_args_passes_literal_model_token_in_prompt_through() {
+        let backend = make_backend(vec!["-m", "{model}", "{prompt}"]);
+        let prompt = "explain the {model} placeholder";
+
+        let with_model = backend.build_args(prompt, Some("gpt-x"));
+        assert_eq!(
+            with_model,
+            vec![
+                "-m".to_string(),
+                "gpt-x".to_string(),
+                "explain the {model} placeholder".to_string()
+            ]
+        );
+
+        // With model None, the {model} arg and its preceding flag are dropped,
+        // but the literal token inside the prompt survives.
+        let without_model = backend.build_args(prompt, None);
+        assert_eq!(
+            without_model,
+            vec!["explain the {model} placeholder".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_args_normal_prompts_unchanged() {
+        let backend = make_backend(vec!["-m", "{model}", "--input", "{prompt}"]);
+        let args = backend.build_args("hello world", Some("m1"));
+        assert_eq!(
+            args,
+            vec![
+                "-m".to_string(),
+                "m1".to_string(),
+                "--input".to_string(),
+                "hello world".to_string()
+            ]
+        );
+
+        let args = backend.build_args("hello world", None);
+        assert_eq!(args, vec!["--input".to_string(), "hello world".to_string()]);
+    }
+
+    #[test]
+    fn build_args_model_before_prompt_in_one_arg() {
+        let backend = make_backend(vec!["{model}:{prompt}:{model}"]);
+        let args = backend.build_args("a{model}b", Some("m1"));
+        assert_eq!(args, vec!["m1:a{model}b:m1".to_string()]);
     }
 }
