@@ -31,15 +31,15 @@ Every command reads the same `weir.toml` and supports all backends and workflows
 ### Pre-built binary (coming soon)
 
 ```sh
-curl -fsSL https://github.com/typangaa/otterbridge/releases/latest/download/weir-linux-x86_64 \
+curl -fsSL https://github.com/typangaa/otter/releases/latest/download/weir-linux-x86_64 \
   -o ~/.local/bin/weir && chmod +x ~/.local/bin/weir
 ```
 
 ### Build from source
 
 ```sh
-git clone https://github.com/typangaa/otterbridge
-cd otterbridge
+git clone https://github.com/typangaa/otter
+cd otter
 cargo build --release
 cp target/release/weir ~/.local/bin/weir   # or any directory in $PATH
 ```
@@ -387,7 +387,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 ## Contributing
 
 Issues and pull requests welcome at
-[github.com/typangaa/otterbridge](https://github.com/typangaa/otterbridge).
+[github.com/typangaa/otter](https://github.com/typangaa/otter).
 
 One feature or fix per PR. All new code must include unit tests.
 Run `cargo test` and `cargo clippy` before opening a PR.

@@ -1,10 +1,10 @@
 [package]
 name = "weir"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "weir — a single-binary CLI agent orchestrator that composes, routes and fans out local AI agent CLIs"
-repository = "https://github.com/typangaa/otterbridge"
+repository = "https://github.com/typangaa/otter"
 readme = "README.md"
 keywords = ["llm", "agent", "orchestration", "cli"]
 categories = ["command-line-utilities"]
