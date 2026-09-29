@@ -19,6 +19,7 @@ use crate::backends::stdio_cli::StdioCliBackend;
 use crate::backends::{Backend, ChatMessage, ChatRequest};
 use crate::config::BackendKind;
 use crate::error::{Result, WeirError};
+use crate::exit::ExitKind;
 use crate::observability::{Metrics, MetricsPersister};
 use crate::resilience::ResilientBackend;
 
@@ -27,6 +28,7 @@ mod cli;
 mod config;
 mod engine;
 mod error;
+mod exit;
 mod lease;
 mod observability;
 mod resilience;
@@ -42,15 +44,13 @@ mod resilience;
     long_about = None,
 )]
 struct Cli {
-    /// Path to the weir.toml config file.
-    #[arg(
-        short,
-        long,
-        value_name = "PATH",
-        default_value = "weir.toml",
-        global = true
-    )]
-    config: PathBuf,
+    /// Path to the weir config file.
+    ///
+    /// Resolution order: this flag > `$WEIR_CONFIG` >
+    /// `$XDG_CONFIG_HOME/weir/weir.toml` > `$HOME/.config/weir/weir.toml`.
+    /// `./weir.toml` in the current directory is deliberately never searched.
+    #[arg(short, long, value_name = "PATH", env = "WEIR_CONFIG", global = true)]
+    config: Option<PathBuf>,
 
     /// Emit machine-readable JSON on stdout for all commands.
     #[arg(long, global = true)]
@@ -79,8 +79,13 @@ enum LogFormat {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Validate weir.toml and exit.
-    Validate,
+    /// Validate the config file and exit.
+    ///
+    /// Works for both the legacy (v0.5) schema and `version = 2`. With
+    /// `--deep` (v2 configs only) also probes the environment: worker
+    /// wrappers on PATH, a working `bwrap`, every `wt_roots` entry present in
+    /// agent-jail's `WT_ROOTS`, and a creatable `state_dir`.
+    Validate(ValidateArgs),
 
     /// Manage backends.
     #[command(subcommand)]
@@ -119,6 +124,25 @@ enum Command {
     ///   weir lease run --slot gpu-a=a --slot gpu-b=b -- pi-worker -b {replica} wt notes.md
     #[command(subcommand)]
     Lease(LeaseCommand),
+
+    /// Inspect the configuration itself.
+    #[command(subcommand)]
+    Config(ConfigCommand),
+}
+
+#[derive(Debug, Args)]
+struct ValidateArgs {
+    /// Also probe the environment (v2 configs only): worker wrappers on PATH,
+    /// a working bwrap, agent-jail WT_ROOTS, and a creatable state_dir.
+    #[arg(long)]
+    deep: bool,
+}
+
+/// `weir config …` subcommands.
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the resolved config file path and exit.
+    Path,
 }
 
 /// `weir lease …` subcommands.
@@ -312,17 +336,41 @@ struct WorkflowRunArgs {
 async fn main() {
     let cli = Cli::parse();
     let json = cli.json;
-    let config_path = cli.config.clone();
+    let explicit_config = cli.config.clone();
     let log_level = cli.log_level.clone();
     let json_log = matches!(cli.log_format, LogFormat::Json);
 
-    let exit_code = dispatch(cli, &config_path, json, json_log, &log_level).await;
+    let exit_code = dispatch(cli, explicit_config.as_deref(), json, json_log, &log_level).await;
     process::exit(exit_code);
+}
+
+/// Resolve the config file for a command that needs one.
+///
+/// On failure the message goes to stderr (plus a JSON object on stdout in
+/// `--json` mode) and the caller returns [`ExitKind::Usage`]'s process code
+/// (2) straight away.
+fn resolve_config_or_exit(
+    explicit: Option<&Path>,
+    json: bool,
+) -> std::result::Result<PathBuf, i32> {
+    match config::resolve::resolve(explicit) {
+        Ok(path) => {
+            if explicit.is_some() && !path.is_file() {
+                eprintln!("error: {}", config::resolve::missing_explicit(&path));
+                return Err(ExitKind::Usage.to_process_code());
+            }
+            Ok(path)
+        }
+        Err(e) => {
+            cli::validate::report_unresolved(&e, json);
+            Err(ExitKind::Usage.to_process_code())
+        }
+    }
 }
 
 async fn dispatch(
     cli: Cli,
-    config_path: &Path,
+    explicit_config: Option<&Path>,
     json: bool,
     json_log: bool,
     log_level: &str,
@@ -332,12 +380,33 @@ async fn dispatch(
     // stdout clean for command output (and `--json`).
     observability::init_tracing(json_log, log_level);
 
+    // Commands that read the config resolve it lazily: `lease`, `version`,
+    // `schema` and `config path` must keep working with no config at all.
+    let needs_config = !matches!(
+        cli.command,
+        Command::Version | Command::Schema | Command::Lease(_) | Command::Config(_)
+    );
+    let resolved = if needs_config {
+        match resolve_config_or_exit(explicit_config, json) {
+            Ok(p) => Some(p),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+    let config_path: &Path = resolved
+        .as_deref()
+        .unwrap_or_else(|| Path::new("weir.toml"));
+
     match cli.command {
         // ── validate ──────────────────────────────────────────────────────────
-        Command::Validate => match cli::validate::validate_config(config_path, json) {
-            Ok(()) => 0,
-            Err(e) => exit_code_for(&e),
-        },
+        Command::Validate(args) => {
+            match cli::validate::validate_config(config_path, args.deep, json) {
+                cli::validate::ValidateStatus::Ok => 0,
+                cli::validate::ValidateStatus::Invalid => 1,
+                cli::validate::ValidateStatus::Usage => ExitKind::Usage.to_process_code(),
+            }
+        }
 
         // ── backend list ──────────────────────────────────────────────────────
         Command::Backend(BackendCommand::List) => match config::Config::load(config_path) {
@@ -588,6 +657,25 @@ async fn dispatch(
         // ── lease (never touches weir.toml) ───────────────────────────────────
         Command::Lease(LeaseCommand::Run(args)) => lease::run(args).await,
         Command::Lease(LeaseCommand::Status(args)) => lease::status(json || args.json_flag()),
+
+        // ── config path ──────────────────────────────────────────────────────
+        Command::Config(ConfigCommand::Path) => match config::resolve::resolve(explicit_config) {
+            Ok(path) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"status": "ok", "path": path.display().to_string()})
+                    );
+                } else {
+                    println!("{}", path.display());
+                }
+                0
+            }
+            Err(e) => {
+                cli::validate::report_unresolved(&e, json);
+                ExitKind::Usage.to_process_code()
+            }
+        },
 
         // ── version ───────────────────────────────────────────────────────────
         Command::Version => {

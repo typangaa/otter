@@ -4,7 +4,11 @@
 //! `serde` into [`Config`]. The CLI mutates it via `toml_edit` (comment-preserving)
 //! — see the `editor` module (added in v0.2).
 
+pub mod resolve;
 pub mod validate;
+// consumed by later phases
+#[allow(dead_code)]
+pub mod v2;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
