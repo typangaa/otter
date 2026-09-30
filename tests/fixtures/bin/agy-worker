@@ -1,0 +1,66 @@
+#!/bin/sh
+# Fake `agy-worker` wrapper for the integration tests.
+#
+# Behaviour is selected by $FAKE_WORKER_MODE (default: ok). The last arguments
+# follow the wrapper contract: [-m MODEL] -t <secs> <workdir> <prompt_file>.
+#
+# Modes:
+#   ok         print "fake ok args: $*" to stdout, exit 0
+#   grandchild start `sleep 300 &` (grandchild), record its pid in
+#              $FAKE_WORKER_PIDFILE, print "started", then block forever
+#   quota      quota-shaped message on stderr, exit 3
+#   empty      empty-answer message on stderr, exit 3
+#   denied     exit 6 (permission denied inside the jail)
+#   big        write ~10 MiB to stdout, exit 0
+#   big-err    write > 8 MiB to stderr, then a final RESOURCE_EXHAUSTED line,
+#              exit 3 (the quota message arrives past the retained head cap)
+#   args       print every argument on its own line, exit 0
+
+me=$(basename "$0")
+
+case "${FAKE_WORKER_MODE:-ok}" in
+    ok)
+        printf 'fake ok args: %s\n' "$*"
+        exit 0
+        ;;
+    grandchild)
+        sleep 300 &
+        gp=$!
+        if [ -n "${FAKE_WORKER_PIDFILE:-}" ]; then
+            printf '%s\n' "$gp" >"$FAKE_WORKER_PIDFILE"
+        fi
+        printf 'started\n'
+        sleep 300
+        exit 0
+        ;;
+    quota)
+        printf '%s: status=error error=RESOURCE_EXHAUSTED quota\n' "$me" >&2
+        exit 3
+        ;;
+    empty)
+        printf '%s: status=empty\n' "$me" >&2
+        exit 3
+        ;;
+    denied)
+        exit 6
+        ;;
+    big)
+        head -c 10485760 /dev/zero | tr '\0' 'x'
+        exit 0
+        ;;
+    big-err)
+        head -c 10485760 /dev/zero | tr '\0' 'y' >&2
+        printf 'RESOURCE_EXHAUSTED\n' >&2
+        exit 3
+        ;;
+    args)
+        for a in "$@"; do
+            printf '%s\n' "$a"
+        done
+        exit 0
+        ;;
+    *)
+        printf '%s: unknown FAKE_WORKER_MODE %s\n' "$me" "${FAKE_WORKER_MODE}" >&2
+        exit 70
+        ;;
+esac
