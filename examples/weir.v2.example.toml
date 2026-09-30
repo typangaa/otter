@@ -1,0 +1,62 @@
+# weir config v2 — full example.
+# Unknown keys are a hard error (deny_unknown_fields).
+version = 2
+
+[paths]
+# Worktree roots. Each must equal agent-jail's WT_ROOT (validate --deep greps it).
+wt_roots = ["~/Documents/echomeo-wt", "~/Documents/otter-wt"]
+# Leases, cooldown.json, ledger.jsonl, tasks/<id>/.
+# Default if omitted: ${XDG_STATE_HOME:-~/.local/state}/weir
+state_dir = "~/.local/state/weir"
+# Scratch dir for `weir ask` (the jail's scratch mode). Default: /tmp/pilot
+scratch = "/tmp/pilot"
+
+# Capacity-1 leases = one llama.cpp slot each; agy = concurrency cap on the
+# cloud quota. capacity must be > 0.
+[slots]
+gpu-a = { capacity = 1 } # llama.cpp replica a (:18080)
+gpu-b = { capacity = 1 } # llama.cpp replica b (:18081)
+agy   = { capacity = 2 } # cloud API concurrency
+
+# Workers. command must be exactly "<name>-worker" (bare wrapper on PATH,
+# no '/'). pi slots keys: a|b only. agy slots keys: "any" only.
+[worker.pi]
+command      = "pi-worker"          # default; must match ^[a-z]+-worker$ (enforced)
+replica_args = ["-b", "{replica}"]  # how to pin: a|b (weir never passes "pool")
+timeout      = 900                  # seconds, required, > 0
+slots        = { a = "gpu-a", b = "gpu-b" }
+
+[worker.agy]
+command       = "agy-worker"
+model_args    = ["-m", "{model}"]
+default_model = "gemini-3.8-flash-high"
+timeout       = 3600                # wall-clock seconds, required, > 0
+slots         = { any = "agy" }
+quota_pattern = "RESOURCE_EXHAUSTED" # exit 3 + this in stderr => kind=quota
+quota_cooldown = "30m"               # integer + unit s|m|h|d, must be > 0
+
+# Escalation ladder (used on timeout|empty|quota, never on denied/jail/check-fail).
+# Each step is "<worker>:<arg>"; pi args: auto|a|b; agy args: any non-empty model id.
+[ladder.default]
+steps = [
+  "pi:auto",
+  "agy:gemini-3.8-flash-high",
+  "agy:claude-opus-4-6-thinking",
+]
+fresh_worktree_per_step = true # never re-run on a dirty tree
+
+# Jailed verification checks (run under agent-jail; they execute agent-written code).
+[check.web-typecheck]
+cwd     = "frontend"
+cmd     = ["npx", "tsc", "--noEmit", "-p", "tsconfig.app.json"]
+timeout = 300
+
+[check.web-lint]
+cwd     = "frontend"
+cmd     = ["npm", "run", "lint"]
+timeout = 300
+
+[check.backend-tests]
+cwd     = "backend"
+cmd     = ["pytest", "-q", "-x"]
+timeout = 600

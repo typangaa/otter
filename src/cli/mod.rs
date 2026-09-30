@@ -13,6 +13,7 @@
 //!   error, 2 = system / unexpected error.
 
 pub mod backend;
+pub mod deep;
 pub mod status;
 pub mod validate;
 pub mod workflow;
