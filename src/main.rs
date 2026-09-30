@@ -32,6 +32,7 @@ mod exit;
 mod lease;
 mod observability;
 mod resilience;
+mod worker;
 
 // ── top-level CLI ─────────────────────────────────────────────────────────────
 
@@ -125,9 +126,30 @@ enum Command {
     #[command(subcommand)]
     Lease(LeaseCommand),
 
+    /// Run one worker wrapper directly (precursor of `weir task run`).
+    ///
+    /// Reads the `version = 2` config, builds the wrapper argv
+    /// (`<worker>-worker [-b REPLICA|-m MODEL] -t <secs> <WORKDIR> <PROMPT_FILE>`)
+    /// and spawns it in its own process group with capped output and a hard
+    /// deadline. It only ever execs `pi-worker` / `agy-worker` from PATH — the
+    /// allow-list is hard-coded and re-checked at spawn time. No lease, no
+    /// worktree, no checks: that is what `weir task run` will add.
+    ///
+    /// Example:
+    ///   weir worker run --worker pi --replica a /wt/notes /tmp/prompt.md
+    #[command(subcommand)]
+    Worker(WorkerCommand),
+
     /// Inspect the configuration itself.
     #[command(subcommand)]
     Config(ConfigCommand),
+}
+
+/// `weir worker …` subcommands.
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Run one allow-listed worker wrapper and report its result.
+    Run(worker::cli::WorkerRunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -653,6 +675,11 @@ async fn dispatch(
                 exit_code_for(&e)
             }
         },
+
+        // ── worker run (needs a v2 config) ────────────────────────────────────
+        Command::Worker(WorkerCommand::Run(args)) => {
+            worker::cli::run(config_path, &args, json || args.json_flag()).await
+        }
 
         // ── lease (never touches weir.toml) ───────────────────────────────────
         Command::Lease(LeaseCommand::Run(args)) => lease::run(args).await,
