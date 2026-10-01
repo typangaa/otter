@@ -247,7 +247,18 @@ GPU slot leases (no weir.toml needed):
     [--affinity KEY]
     [--wait-timeout SECS]
     -- <CMD> [ARGS]...
-  lease status [--json]             List every known slot: held / free (+ record)
+  lease status [--json]             List every known slot: held / free (+ record),
+                                    and agy models still cooling down after a quota
+
+Task runs (worktree + jailed worker + checks, one JSON record):
+  task run --repo PATH (--worker pi|agy | --ladder NAME) [--base REV]
+    [--replica auto|a|b] [--model M] [--timeout SECS] [--check NAME]...
+    [--cleanup never|on-success|always] (--prompt-file F | --prompt-stdin)
+                                    --ladder escalates on timeout/empty/quota,
+                                    one fresh worktree (<id>-s<N>) per step
+  task show ID [--patch]            Print a ledger record (and its diff)
+  task list [--since 24h]           List recent task records
+  task clean ID|--merged|--older-than D   Remove worktrees and wt/* branches
 
 Config management:
   validate                          Validate weir.toml and exit
@@ -275,7 +286,8 @@ model server). It is independent of `weir.toml` — no config file is read.
 ```sh
 weir lease run --slot gpu-a=a --slot gpu-b=b -- pi-worker -b {replica} -t 900 <worktree> <prompt.md>
 weir lease status          # gpu-a  held  pid=123 replica=a command=pi-worker -b a …
-weir lease status --json   # [{"slot":"gpu-a","state":"held","record":{…}}, …]
+weir lease status --json   # {"slots":[{"slot":"gpu-a","state":"held","record":{…}}, …],
+                           #  "cooldowns":{"agy":{"<model>":<unix until>}}}
 ```
 
 - **Slots.** Each `--slot NAME=REPLICA` is one mutually-exclusive slot. weir

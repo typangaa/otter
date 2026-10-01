@@ -420,7 +420,8 @@ fn status_json(state_dir: &Path, bin: &Path) -> Option<Value> {
 
 /// Look up one slot in a `lease status --json` array.
 fn slot_row<'a>(rows: &'a Value, slot: &str) -> Option<&'a Value> {
-    rows.as_array()?
+    rows["slots"]
+        .as_array()?
         .iter()
         .find(|r| r["slot"].as_str() == Some(slot))
 }
@@ -782,7 +783,7 @@ fn lease_status_reports_held_then_free() {
 
     // No lease file yet ⇒ empty list.
     let rows = status_json(&state, &bin).expect("status json");
-    assert_eq!(rows.as_array().map(Vec::len), Some(0));
+    assert_eq!(rows["slots"].as_array().map(Vec::len), Some(0));
 
     let runner = std::process::Command::new(assert_cmd::cargo::cargo_bin("weir"))
         .env("WEIR_STATE_DIR", &state)

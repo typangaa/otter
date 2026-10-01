@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fake `pi-worker` wrapper for the integration tests.
 #
-# Behaviour is selected by $FAKE_WORKER_MODE (default: ok). The last arguments
+# Behaviour is selected by $FAKE_PI_MODE, else $FAKE_WORKER_MODE (default: ok), so a
+# ladder test can give each worker its own mode. The last arguments
 # follow the wrapper contract: [-b a] -t <secs> <workdir> <prompt_file>.
 #
 # Modes:
@@ -18,10 +19,12 @@
 #   edit       append "edited by fake worker" to <workdir>/${FAKE_EDIT_FILE:-edited.txt},
 #              print "edited", exit 0
 #   jail       print "agent-jail: refused: fake" to stderr, exit 5
+#   edit-empty like edit, then report an empty answer on stderr and exit 3
+#              (partial work left behind by a failed attempt)
 
 me=$(basename "$0")
 
-case "${FAKE_WORKER_MODE:-ok}" in
+case "${FAKE_PI_MODE:-${FAKE_WORKER_MODE:-ok}}" in
     ok)
         printf 'fake ok args: %s\n' "$*"
         exit 0
@@ -74,6 +77,19 @@ case "${FAKE_WORKER_MODE:-ok}" in
         printf 'edited by fake worker\n' >> "$workdir/$target_file"
         printf 'edited\n'
         exit 0
+        ;;
+    edit-empty)
+        prev=""
+        last=""
+        for a in "$@"; do
+            prev="$last"
+            last="$a"
+        done
+        workdir="$prev"
+        target_file="${FAKE_EDIT_FILE:-edited.txt}"
+        printf 'edited by fake worker\n' >> "$workdir/$target_file"
+        printf '%s: status=empty\n' "$me" >&2
+        exit 3
         ;;
     jail)
         printf 'agent-jail: refused: fake\n' >&2

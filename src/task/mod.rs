@@ -7,6 +7,7 @@
 
 pub mod check;
 pub mod cli;
+pub mod cooldown;
 pub mod git;
 pub mod id;
 pub mod ledger;
