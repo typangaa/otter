@@ -15,6 +15,9 @@
 #   big-err    write > 8 MiB to stderr, then a final RESOURCE_EXHAUSTED line,
 #              exit 3 (the quota message arrives past the retained head cap)
 #   args       print every argument on its own line, exit 0
+#   edit       append "edited by fake worker" to <workdir>/${FAKE_EDIT_FILE:-edited.txt},
+#              print "edited", exit 0
+#   jail       print "agent-jail: refused: fake" to stderr, exit 5
 
 me=$(basename "$0")
 
@@ -58,6 +61,23 @@ case "${FAKE_WORKER_MODE:-ok}" in
             printf '%s\n' "$a"
         done
         exit 0
+        ;;
+    edit)
+        prev=""
+        last=""
+        for a in "$@"; do
+            prev="$last"
+            last="$a"
+        done
+        workdir="$prev"
+        target_file="${FAKE_EDIT_FILE:-edited.txt}"
+        printf 'edited by fake worker\n' >> "$workdir/$target_file"
+        printf 'edited\n'
+        exit 0
+        ;;
+    jail)
+        printf 'agent-jail: refused: fake\n' >&2
+        exit 5
         ;;
     *)
         printf '%s: unknown FAKE_WORKER_MODE %s\n' "$me" "${FAKE_WORKER_MODE}" >&2

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Fake `agent-jail` wrapper for integration tests.
+
+if [ "$#" -lt 3 ] || [ "$2" != "--" ] || [ ! -d "$1" ]; then
+    printf 'usage: agent-jail <dir> -- <cmd...>\n' >&2
+    exit 2
+fi
+
+target_dir="$1"
+shift 2
+
+if [ -n "${FAKE_JAIL_LOG:-}" ]; then
+    printf '%s -- %s\n' "$target_dir" "$*" >> "$FAKE_JAIL_LOG"
+fi
+
+if [ "${FAKE_JAIL_REFUSE:-0}" = "1" ]; then
+    printf 'agent-jail: refused: fake\n' >&2
+    exit 5
+fi
+
+cd "$target_dir" || exit 1
+exec "$@"

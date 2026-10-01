@@ -118,7 +118,7 @@ impl LeaseStatusArgs {
 
 /// Root of weir's writable state: `$WEIR_STATE_DIR`, else
 /// `${XDG_STATE_HOME:-$HOME/.local/state}/weir`.
-fn state_root() -> Option<PathBuf> {
+pub(crate) fn state_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("WEIR_STATE_DIR") {
         if !dir.is_empty() {
             return Some(PathBuf::from(dir));
@@ -294,7 +294,9 @@ fn now_unix() -> u64 {
 /// The JSON written into the lock file while the lease is held.
 fn record_json(slot: &str, replica: &str, pid: u32, program: &str, args: &[String]) -> String {
     let mut full = Vec::with_capacity(1 + args.len());
-    full.push(program.to_owned());
+    if !program.is_empty() {
+        full.push(program.to_owned());
+    }
     full.extend_from_slice(args);
     serde_json::json!({
         "slot": slot,
@@ -407,6 +409,147 @@ pub struct AcquiredLease {
     /// Arguments for the spawned worker (with `{replica}` resolved) — the
     /// program name is *not* included, it is passed separately to exec.
     child_args: Vec<String>,
+}
+
+// ── public blocking API (used by `weir task run`) ──────────────────────────────
+
+/// A held slot. Dropping it releases the flock, which is what releases the
+/// slot — the same mechanism `weir lease run` relies on.
+pub struct SlotLease {
+    /// Name of the slot that was taken (also the lock file stem).
+    pub slot: String,
+    /// Replica the slot is bound to (`{replica}` expansion happens upstream).
+    pub replica: String,
+    /// Milliseconds spent waiting for a free slot.
+    pub queue_wait_ms: u64,
+    /// The flock handle — never read, dropping it releases the slot.
+    _lease: LeaseFile,
+}
+
+impl std::fmt::Debug for SlotLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotLease")
+            .field("slot", &self.slot)
+            .field("replica", &self.replica)
+            .field("queue_wait_ms", &self.queue_wait_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reject a slot name that could escape the leases directory.
+fn slot_name_usable(slot: &str) -> bool {
+    !slot.is_empty() && !slot.contains('/') && slot != "." && slot != ".."
+}
+
+/// Block (polling, no deadline) until one of `candidates` — `(slot name,
+/// replica)` pairs — is free, preferring the slot `affinity.json` maps
+/// `affinity` to.
+///
+/// Lock files live in `root/leases/<slot>.lock`; the lease record (program +
+/// args = `holder`) is written while the lock is held, and `affinity.json` in
+/// `root` is updated when an `affinity` key is given. A slot name containing
+/// `/` or equal to `.` / `..` is an [`std::io::ErrorKind::InvalidInput`] error.
+///
+/// Synchronous: the wait loop sleeps, so call it via
+/// [`tokio::task::spawn_blocking`] to keep the runtime's worker threads free.
+pub fn acquire_slot(
+    root: &Path,
+    candidates: &[(String, String)],
+    affinity: Option<&str>,
+    holder: &[String],
+) -> std::io::Result<SlotLease> {
+    for (slot, _) in candidates {
+        if !slot_name_usable(slot) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid lease slot name {slot:?}"),
+            ));
+        }
+    }
+    std::fs::create_dir_all(leases_dir(root))?;
+
+    let (index, lease, queue_wait_ms) = wait_for_candidates(root, candidates, affinity)?;
+    let (slot, replica) = &candidates[index];
+
+    // Record the holder while the lock is held; `status` reads exactly this.
+    // The record's "command" is exactly `holder.join(" ")`: no synthetic argv[0]
+    // in front, so an empty holder yields an empty command and a non-empty one
+    // never grows a leading space.
+    let (program, args) = match holder.split_first() {
+        Some((first, rest)) => (first.as_str(), rest),
+        None => ("", &[][..]),
+    };
+    lease.write_record(&record_json(
+        slot,
+        replica,
+        std::process::id(),
+        program,
+        args,
+    ))?;
+    if let Some(key) = affinity {
+        let file = root.join("affinity.json");
+        if let Err(e) = write_affinity(&file, key, slot) {
+            eprintln!("weir lease: warning: cannot update {}: {e}", file.display());
+        }
+    }
+
+    Ok(SlotLease {
+        slot: slot.clone(),
+        replica: replica.clone(),
+        queue_wait_ms,
+        _lease: lease,
+    })
+}
+
+/// Poll `candidates` in preference order until one locks (no deadline): the
+/// affinity hit first, then the order given. Returns `(index, lock, wait ms)`.
+/// A busy slot (`WouldBlock`) is retried forever; a hard I/O error is returned
+/// instead of spinning on something that will not fix itself.
+fn wait_for_candidates(
+    root: &Path,
+    candidates: &[(String, String)],
+    affinity: Option<&str>,
+) -> std::io::Result<(usize, LeaseFile, u64)> {
+    if candidates.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no lease slot candidates given",
+        ));
+    }
+    let order = candidate_order(candidates, affinity, root);
+    let waited = Instant::now();
+    loop {
+        // `busy` only survives if every candidate failed this round AND no
+        // candidate ever reported a hard error.
+        let mut busy = false;
+        for &i in &order {
+            match acquire(&lock_path(root, &candidates[i].0)) {
+                Ok(lease) => return Ok((i, lease, waited.elapsed().as_millis() as u64)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => busy = true,
+                Err(e) => return Err(e),
+            }
+        }
+        debug_assert!(busy, "an empty candidate list is rejected above");
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Candidate preference: the slot `affinity` maps to first, then the given
+/// order — the same rule [`preference_order`] implements for the CLI.
+fn candidate_order(
+    candidates: &[(String, String)],
+    affinity: Option<&str>,
+    root: &Path,
+) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    let hit = affinity.and_then(|key| read_affinity(&root.join("affinity.json")).get(key).cloned());
+    if let Some(hit) = hit {
+        if let Some(pos) = candidates.iter().position(|c| c.0 == hit) {
+            order.remove(pos);
+            order.insert(0, pos);
+        }
+    }
+    order
 }
 
 /// Why waiting for a slot stopped.
@@ -742,4 +885,139 @@ fn print_human(row: &SlotStatus) {
         }
     }
     println!("{:<20} held  {}", row.slot, parts.join(" "));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(slot: &str, replica: &str) -> (String, String) {
+        (slot.to_owned(), replica.to_owned())
+    }
+
+    /// The lock file of `slot` is held (flock fails) while a lease is alive.
+    fn held(root: &Path, slot: &str) -> bool {
+        match acquire(&lock_path(root, slot)) {
+            Ok(_) => false,
+            Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+        }
+    }
+
+    #[test]
+    fn acquire_slot_locks_records_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let lease = acquire_slot(
+            root,
+            &[pair("gpu-a", "a")],
+            Some("repo-key"),
+            &["pi-worker".to_owned(), "-b".to_owned(), "a".to_owned()],
+        )
+        .expect("acquire");
+
+        assert_eq!(lease.slot, "gpu-a");
+        assert_eq!(lease.replica, "a");
+        assert!(held(root, "gpu-a"), "the lock must be held");
+
+        // The record carries the holder, the way `lease status` reads it.
+        let snapshot = LeaseFile::open(&lock_path(root, "gpu-a"))
+            .expect("open")
+            .snapshot();
+        let record = parse_record(&snapshot).expect("record");
+        assert_eq!(record["slot"], "gpu-a");
+        assert_eq!(record["replica"], "a");
+        assert_eq!(record["command"], "pi-worker -b a");
+        assert!(
+            !record["command"].as_str().unwrap().starts_with(' '),
+            "command must not start with a space: {:?}",
+            record["command"]
+        );
+
+        // Affinity was persisted, so the next taker prefers this slot.
+        let affinity = read_affinity(&root.join("affinity.json"));
+        assert_eq!(affinity.get("repo-key").map(String::as_str), Some("gpu-a"));
+
+        drop(lease);
+        assert!(!held(root, "gpu-a"), "drop must release the flock");
+    }
+
+    #[test]
+    fn acquire_slot_prefers_the_affinity_slot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        write_affinity(&root.join("affinity.json"), "key", "gpu-b").expect("affinity");
+
+        let lease = acquire_slot(
+            root,
+            &[pair("gpu-a", "a"), pair("gpu-b", "b")],
+            Some("key"),
+            &[],
+        )
+        .expect("acquire");
+        assert_eq!(lease.slot, "gpu-b");
+        assert_eq!(lease.replica, "b");
+    }
+
+    /// Run `acquire_slot(candidates)` in a background thread, so a test can
+    /// observe whether it is blocked or has returned.
+    fn spawn_waiter(
+        root: &Path,
+        candidates: Vec<(String, String)>,
+    ) -> std::thread::JoinHandle<SlotLease> {
+        let root = root.to_path_buf();
+        std::thread::spawn(move || {
+            acquire_slot(&root, &candidates, None, &["agy-worker".to_owned()]).expect("acquire")
+        })
+    }
+
+    #[test]
+    fn acquire_slot_takes_the_second_candidate_when_the_first_is_busy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Part 1: gpu-a is held, so the waiter must promptly take gpu-b.
+        let first = acquire_slot(root, &[pair("gpu-a", "a")], None, &[]).expect("first");
+        assert!(held(root, "gpu-a"));
+        let waiter = spawn_waiter(root, vec![pair("gpu-a", "a"), pair("gpu-b", "b")]);
+        std::thread::sleep(POLL_INTERVAL * 2);
+        assert!(held(root, "gpu-a"), "the first holder still owns gpu-a");
+        let lease = waiter.join().expect("waiter");
+        assert_eq!(lease.slot, "gpu-b");
+        assert_eq!(lease.replica, "b");
+        assert!(
+            lease.queue_wait_ms < 60_000,
+            "waited {} ms for a free gpu-b",
+            lease.queue_wait_ms
+        );
+
+        // Part 2: both slots held, so a waiter stays blocked until gpu-a frees.
+        // `lease` (from part 1) still owns gpu-b; its lock is what keeps the
+        // waiter waiting for gpu-a.
+        assert!(held(root, "gpu-a") && held(root, "gpu-b"));
+        let blocked = spawn_waiter(root, vec![pair("gpu-a", "a"), pair("gpu-b", "b")]);
+        std::thread::sleep(POLL_INTERVAL * 2);
+        assert!(
+            !blocked.is_finished(),
+            "the waiter must stay blocked while both slots are held"
+        );
+        drop(first);
+        let lease = blocked.join().expect("waiter");
+        assert_eq!(lease.slot, "gpu-a");
+        assert_eq!(lease.replica, "a");
+        // `first` is already dropped, `lease` drops here: no thread
+        // and no held lock outlives the test.
+    }
+
+    #[test]
+    fn acquire_slot_rejects_unusable_slot_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for bad in ["../evil", "a/b", ".", "..", ""] {
+            let err =
+                acquire_slot(tmp.path(), &[pair(bad, "a")], None, &[]).expect_err("must reject");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
+        }
+        // Nothing was created for a rejected name.
+        assert!(!leases_dir(tmp.path()).exists());
+    }
 }

@@ -32,6 +32,7 @@ mod exit;
 mod lease;
 mod observability;
 mod resilience;
+mod task;
 mod worker;
 
 // ── top-level CLI ─────────────────────────────────────────────────────────────
@@ -125,6 +126,22 @@ enum Command {
     ///   weir lease run --slot gpu-a=a --slot gpu-b=b -- pi-worker -b {replica} wt notes.md
     #[command(subcommand)]
     Lease(LeaseCommand),
+
+    /// Task lifecycle: run a worker in a fresh git worktree, then inspect or
+    /// garbage-collect the recorded tasks.
+    ///
+    /// `run` admits the task (id, prompt file, worktree, GPU slot lease), runs
+    /// one allow-listed worker wrapper in it, captures the diff and a patch
+    /// file, runs the `[check.*]` entries under `agent-jail`, applies the
+    /// cleanup policy and appends one `weir.task/1` line to the ledger. `show`,
+    /// `list` and `clean` read that ledger; `clean` never removes a branch
+    /// other than `wt/<id>` nor a path outside `paths.wt_roots`.
+    ///
+    /// Example:
+    ///   weir task run --repo ~/repo --base main --worker pi \\
+    ///       --prompt-file notes.md --check typecheck --json
+    #[command(subcommand)]
+    Task(task::cli::TaskCommand),
 
     /// Run one worker wrapper directly (precursor of `weir task run`).
     ///
@@ -674,6 +691,25 @@ async fn dispatch(
                 eprintln!("error: {e}");
                 exit_code_for(&e)
             }
+        },
+
+        // ── task run / show / list / clean (need a v2 config) ─────────────
+        Command::Task(sub) => match sub {
+            task::cli::TaskCommand::Run(args) => {
+                task::run::run(config_path, &args, json || args.json).await
+            }
+            task::cli::TaskCommand::Show(args) => match task::cli::load_v2(config_path) {
+                Ok(cfg) => task::cli::show(&cfg, &args, json || args.json),
+                Err(e) => task::cli::usage_error(json, &e),
+            },
+            task::cli::TaskCommand::List(args) => match task::cli::load_v2(config_path) {
+                Ok(cfg) => task::cli::list(&cfg, &args, json || args.json),
+                Err(e) => task::cli::usage_error(json, &e),
+            },
+            task::cli::TaskCommand::Clean(args) => match task::cli::load_v2(config_path) {
+                Ok(cfg) => task::cli::clean(&cfg, &args, json || args.json),
+                Err(e) => task::cli::usage_error(json, &e),
+            },
         },
 
         // ── worker run (needs a v2 config) ────────────────────────────────────
