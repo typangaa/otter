@@ -16,12 +16,14 @@ use assert_cmd::Command;
 use serde_json::Value;
 
 /// Env vars cleared on every weir invocation to guarantee hermetic execution.
-const PINNED_VARS: [&str; 11] = [
+const PINNED_VARS: [&str; 13] = [
     "WEIR_CONFIG",
     "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
     "WEIR_STATE_DIR",
     "FAKE_WORKER_MODE",
+    "FAKE_PI_MODE",
+    "FAKE_AGY_MODE",
     "FAKE_WORKER_PIDFILE",
     "FAKE_EDIT_FILE",
     "FAKE_JAIL_LOG",
@@ -281,6 +283,12 @@ impl Fix {
             prompt,
             tmp,
         }
+    }
+
+    /// The lease state root weir resolves under this fixture (`HOME=cwd`, no
+    /// `WEIR_STATE_DIR`): where `cooldown.json` and `leases/` live.
+    fn lease_root(&self) -> PathBuf {
+        self.cwd.join(".local/state/weir")
     }
 
     fn cmd(&self) -> Command {
@@ -1710,4 +1718,399 @@ fn explicit_id_main_is_a_usage_error() {
     ]);
     let out = cmd.output().expect("output");
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
+fn ladder_and_worker_flags_mutually_exclusive() {
+    let fix = Fix::new();
+    let mut cmd = fix.cmd();
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--worker",
+        "pi",
+        "--ladder",
+        "my-ladder",
+        "--prompt-file",
+        "p.md",
+    ]);
+    let out = cmd.output().expect("output");
+    assert_eq!(out.status.code(), Some(2));
+    fix.assert_no_side_effects();
+}
+
+#[test]
+fn ladder_quota_escalates_and_writes_cooldown() {
+    let fix = Fix::new();
+    let cfg_text = format!(
+        "{}\n[ladder.my-ladder]\nsteps = [\"agy:gpt-4\", \"pi:a\"]\nfresh_worktree_per_step = true\n",
+        v2_config(&fix.wt_root, &fix.state_dir, &fix.scratch, "pi-worker")
+    );
+    let custom_cfg = fix.cwd.join("ladder.toml");
+    std::fs::write(&custom_cfg, &cfg_text).unwrap();
+
+    let mut cmd = fix.cmd_with_config(&custom_cfg);
+    cmd.env("FAKE_WORKER_MODE", "quota");
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--ladder",
+        "my-ladder",
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    let out = cmd.output().expect("output");
+
+    assert_eq!(out.status.code(), Some(7));
+
+    let text = std::fs::read_to_string(fix.lease_root().join("cooldown.json")).unwrap();
+    let store: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(store["agy"]["gpt-4"].is_number());
+
+    let mut cmd2 = fix.cmd_with_config(&custom_cfg);
+    cmd2.env("FAKE_WORKER_MODE", "quota");
+    cmd2.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--ladder",
+        "my-ladder",
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    let out2 = cmd2.output().expect("output");
+    assert_eq!(out2.status.code(), Some(7));
+
+    let v2 = json_of(&out2);
+    let attempts = v2["attempts"].as_array().unwrap();
+    assert_eq!(attempts[0]["kind"], "skipped_cooldown");
+    assert_eq!(attempts[1]["kind"], "empty");
+
+    // `lease status` reads no config, yet reports the same cooldown.
+    let mut status = fix.cmd_with_config(&custom_cfg);
+    status.args(["lease", "status", "--json"]);
+    let status_out = status.output().expect("status output");
+    assert_eq!(status_out.status.code(), Some(0));
+    let v3: Value = serde_json::from_slice(&status_out.stdout).expect("status json");
+    assert!(v3["cooldowns"]["agy"]["gpt-4"].is_number(), "{v3}");
+}
+
+#[test]
+fn ladder_denied_does_not_escalate() {
+    let fix = Fix::new();
+    let cfg_text = format!(
+        "{}\n[ladder.my-ladder]\nsteps = [\"agy:gpt-4\", \"pi:a\"]\n",
+        v2_config(&fix.wt_root, &fix.state_dir, &fix.scratch, "pi-worker")
+    );
+    let custom_cfg = fix.cwd.join("ladder2.toml");
+    std::fs::write(&custom_cfg, &cfg_text).unwrap();
+
+    let mut cmd = fix.cmd_with_config(&custom_cfg);
+    cmd.env("FAKE_WORKER_MODE", "denied");
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--ladder",
+        "my-ladder",
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    let out = cmd.output().expect("output");
+    assert_eq!(out.status.code(), Some(6));
+    let v = json_of(&out);
+    let attempts = v.get("attempts").unwrap().as_array().unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["kind"], "denied");
+}
+
+#[test]
+fn ladder_corrupt_cooldown_ignored() {
+    let fix = Fix::new();
+    let cd_file = fix.lease_root().join("cooldown.json");
+    std::fs::create_dir_all(cd_file.parent().unwrap()).unwrap();
+    std::fs::write(&cd_file, "corrupt json string").unwrap();
+
+    let cfg_text = format!(
+        "{}\n[ladder.my-ladder]\nsteps = [\"agy:gpt-4\", \"pi:a\"]\n",
+        v2_config(&fix.wt_root, &fix.state_dir, &fix.scratch, "pi-worker")
+    );
+    let custom_cfg = fix.cwd.join("ladder3.toml");
+    std::fs::write(&custom_cfg, &cfg_text).unwrap();
+
+    let mut cmd = fix.cmd_with_config(&custom_cfg);
+    cmd.env("FAKE_WORKER_MODE", "quota");
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--ladder",
+        "my-ladder",
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    let out = cmd.output().expect("output");
+    assert_eq!(out.status.code(), Some(7));
+
+    let v = json_of(&out);
+    let attempts = v["attempts"].as_array().unwrap();
+    assert_eq!(attempts[0]["kind"], "quota");
+}
+
+#[test]
+fn ladder_timeout_escalates_with_fresh_worktree() {
+    let fix = Fix::new();
+    let cfg_text = format!(
+        "{}\n[ladder.my-ladder]\nsteps = [\"agy:gpt-4\", \"pi:a\"]\nfresh_worktree_per_step = true\n",
+        v2_config(&fix.wt_root, &fix.state_dir, &fix.scratch, "pi-worker")
+    );
+    let custom_cfg = fix.cwd.join("ladder4.toml");
+    std::fs::write(&custom_cfg, &cfg_text).unwrap();
+
+    let mut cmd = fix.cmd_with_config(&custom_cfg);
+    cmd.env("FAKE_WORKER_MODE", "empty");
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--ladder",
+        "my-ladder",
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    let out = cmd.output().expect("output");
+    assert_eq!(out.status.code(), Some(3));
+    let v = json_of(&out);
+    let attempts = v["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["kind"], "empty");
+    assert_eq!(attempts[1]["kind"], "empty");
+
+    let worktree1 = std::fs::read_dir(fix.wt_root.clone()).unwrap().count();
+    assert_eq!(worktree1, 2);
+}
+
+// ── P5 review regressions ────────────────────────────────────────────────────
+
+/// Write `[ladder.NAME]` with `steps` on top of the fixture config and return
+/// its path.
+fn ladder_config(fix: &Fix, name: &str, steps: &[&str]) -> PathBuf {
+    let steps = steps
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!(
+        "{}\n[ladder.{name}]\nsteps = [{steps}]\n",
+        v2_config(&fix.wt_root, &fix.state_dir, &fix.scratch, "pi-worker")
+    );
+    let path = fix.cwd.join(format!("{name}.toml"));
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// `task run --ladder NAME --json` plus `extra` arguments.
+fn run_ladder(
+    fix: &Fix,
+    cfg: &Path,
+    name: &str,
+    env: &[(&str, &str)],
+    extra: &[&str],
+) -> std::process::Output {
+    let mut cmd = fix.cmd_with_config(cfg);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--ladder",
+        name,
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    cmd.args(extra);
+    cmd.output().expect("output")
+}
+
+/// Directories directly under `wt_root`.
+fn wt_dirs(fix: &Fix) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(&fix.wt_root)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn failed_attempt_still_records_its_partial_diff() {
+    let fix = Fix::new();
+    let mut cmd = fix.cmd();
+    cmd.env("FAKE_WORKER_MODE", "edit-empty");
+    cmd.args([
+        "task",
+        "run",
+        "--repo",
+        fix.repo.to_str().unwrap(),
+        "--base",
+        "main",
+        "--worker",
+        "pi",
+        "--prompt-file",
+        "p.md",
+        "--json",
+    ]);
+    let out = cmd.output().expect("output");
+    assert_eq!(out.status.code(), Some(3));
+    let v = json_of(&out);
+    assert_eq!(v["status"], "empty");
+    assert_eq!(v["diff"]["files"], 1, "partial work must be kept: {v}");
+}
+
+#[test]
+fn ladder_second_step_owns_the_diff_and_lists_the_first_tree() {
+    let fix = Fix::new();
+    let cfg = ladder_config(&fix, "esc", &["agy:m1", "pi:a"]);
+    let out = run_ladder(
+        &fix,
+        &cfg,
+        "esc",
+        &[("FAKE_AGY_MODE", "edit-empty"), ("FAKE_PI_MODE", "ok")],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let v = json_of(&out);
+    let id = v["id"].as_str().unwrap().to_string();
+    assert!(
+        v["worktree"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("{id}-s2")),
+        "record must point at the step-2 tree: {v}"
+    );
+    assert_eq!(v["branch"], format!("wt/{id}-s2"));
+    // Step 2 ran on a fresh tree and changed nothing; step 1's edit is not in it.
+    assert_eq!(
+        v["diff"]["files"], 0,
+        "diff must be of the step-2 tree: {v}"
+    );
+    let extra = v["extra_worktrees"].as_array().expect("extra_worktrees");
+    assert_eq!(extra.len(), 1);
+    assert!(extra[0].as_str().unwrap().ends_with(&id));
+    assert_eq!(v["extra_branches"][0], format!("wt/{id}"));
+    assert_eq!(wt_dirs(&fix), vec![id.clone(), format!("{id}-s2")]);
+}
+
+#[test]
+fn ladder_cleanup_always_removes_every_step_tree() {
+    let fix = Fix::new();
+    let cfg = ladder_config(&fix, "esc", &["agy:m1", "pi:a"]);
+    let out = run_ladder(
+        &fix,
+        &cfg,
+        "esc",
+        &[("FAKE_AGY_MODE", "empty"), ("FAKE_PI_MODE", "ok")],
+        &["--cleanup", "always"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let v = json_of(&out);
+    assert_eq!(v["cleanup"], "removed", "{v}");
+    assert!(wt_dirs(&fix).is_empty(), "left behind: {:?}", wt_dirs(&fix));
+    let branches = git_cmd(&fix.repo)
+        .args(["branch", "--list", "wt/*"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty());
+}
+
+#[test]
+fn task_clean_removes_the_ladder_siblings() {
+    let fix = Fix::new();
+    let cfg = ladder_config(&fix, "esc", &["agy:m1", "pi:a"]);
+    let out = run_ladder(
+        &fix,
+        &cfg,
+        "esc",
+        &[("FAKE_AGY_MODE", "empty"), ("FAKE_PI_MODE", "ok")],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let id = json_of(&out)["id"].as_str().unwrap().to_string();
+    assert_eq!(wt_dirs(&fix).len(), 2);
+
+    let mut clean = fix.cmd_with_config(&cfg);
+    clean.args(["task", "clean", &id, "--json"]);
+    let clean_out = clean.output().expect("clean output");
+    assert_eq!(clean_out.status.code(), Some(0), "{clean_out:?}");
+    assert!(wt_dirs(&fix).is_empty(), "left behind: {:?}", wt_dirs(&fix));
+}
+
+#[test]
+fn ladder_check_failed_does_not_escalate() {
+    let fix = Fix::new();
+    let cfg = ladder_config(&fix, "esc", &["pi:a", "agy:m1"]);
+    let out = run_ladder(
+        &fix,
+        &cfg,
+        "esc",
+        &[("FAKE_PI_MODE", "edit")],
+        &["--check", "fail"],
+    );
+    assert_eq!(out.status.code(), Some(10));
+    let v = json_of(&out);
+    assert_eq!(v["attempts"].as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(wt_dirs(&fix).len(), 1);
+}
+
+#[test]
+fn ladder_accepts_timeout_and_rejects_model() {
+    let fix = Fix::new();
+    let cfg = ladder_config(&fix, "esc", &["pi:a"]);
+    let out = run_ladder(
+        &fix,
+        &cfg,
+        "esc",
+        &[("FAKE_PI_MODE", "args")],
+        &["--timeout", "77"],
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(json_of(&out)["answer"].as_str().unwrap().contains("77"));
+
+    let fix2 = Fix::new();
+    let cfg2 = ladder_config(&fix2, "esc", &["pi:a"]);
+    let out2 = run_ladder(&fix2, &cfg2, "esc", &[], &["--model", "x"]);
+    assert_eq!(out2.status.code(), Some(2));
+    fix2.assert_no_side_effects();
 }

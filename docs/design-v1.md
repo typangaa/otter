@@ -86,7 +86,7 @@ weir task list [--since 24h] [--json]
 weir task clean ID|--merged|--older-than 7d   # git worktree remove + branch -D
 weir ask        --worker W [--replica ...] [--model M] [--timeout S] (--prompt-file F|--prompt-stdin)
                 # read-only Q&A in a fresh /tmp/pilot/<id> scratch dir (the jail's scratch mode)
-weir lease status [--json]         # holder pid/task per slot, agy cooldown until
+weir lease status [--json]         # holder pid/task per slot, agy cooldown until; --json: {slots:[...], cooldowns:{agy:{model:unix}}}
 weir validate [--deep]             # --deep: wrappers on PATH, wt_root == agent-jail WT_ROOT, bwrap works, agy model ids
 weir config path | schema
 ```
@@ -176,7 +176,7 @@ Unknown keys are a hard error (`deny_unknown_fields`). `validate` rejects the fo
 
 1. **Admit.** Allocate the ID (`<yyyymmdd>-<slug>-<4hex>`). Write the prompt to `state_dir/tasks/ID/prompt.md` with mode 0600. The prompt never goes into weir's own argv.
 2. **Worktree.** Run `git -C <repo> worktree add -b wt/<ID> <wt_root>/<ID> <base>`. This runs outside the jail, as the user, and the branch is never main or develop.
-3. **Lease.** For `auto` or `pool`, try `flock -n` on `leases/gpu-a` and then `gpu-b`. If both are held, block on the one the ledger says is least recently used. Record `queue_wait_ms`. Pass the concrete `-b a|b` to the worker, never `pool`, so weir owns placement. **Affinity:** `--affinity KEY` (default: the repo plus the first 2 KB of the prompt, hashed) prefers the replica that last served that key, for prefix-cache warmth. For agy, weir checks `cooldown.json` first; if agy is cooling down, it skips to the next ladder step.
+3. **Lease.** For `auto` or `pool`, try `flock -n` on `leases/gpu-a` and then `gpu-b`. If both are held, block on the one the ledger says is least recently used. Record `queue_wait_ms`. Pass the concrete `-b a|b` to the worker, never `pool`, so weir owns placement. **Affinity:** `--affinity KEY` (default: the repo plus the first 2 KB of the prompt, hashed) prefers the replica that last served that key, for prefix-cache warmth. For agy, weir checks `cooldown.json` first; if that **model** is cooling down, the step is recorded as `skipped_cooldown` without spawning and the ladder moves on. `cooldown.json` lives in the lease state root (the same directory as `leases/`, so `weir lease status` can report it without a config) and maps each agy model to the unix second its cooldown ends: `{"agy":{"<model>":1759300000}}`.
 4. **Run.** Spawn `<worker> [-b r] [-m M] -t <timeout> <wt> <prompt.md>` with the following settings:
    - `process_group(0)`
    - stdout and stderr piped, each capped at 8 MiB
@@ -184,7 +184,7 @@ Unknown keys are a hard error (`deny_unknown_fields`). `validate` rejects the fo
    - `stdin=null`
 
    The weir-side hard deadline is `timeout + 60 s`. When it expires, weir sends `killpg(SIGTERM)`, waits 10 s, then sends `SIGKILL`. SIGINT and SIGTERM to weir trigger the same kill. Once the worker exits, weir releases the lease.
-5. **Classify** the wrapper exit code: 0 ok, 124 timeout, 3 empty (or quota, if `quota_pattern` appears in stderr), 6 denied, 5 jail refused, 2 usage, anything else error. **weir never retries in place.** On a ladder-eligible kind (timeout, empty, quota), the next step gets a fresh worktree, `<ID>-s2`.
+5. **Classify** the wrapper exit code: 0 ok, 124 timeout, 3 empty (or quota, if `quota_pattern` appears in stderr), 6 denied, 5 jail refused, 2 usage, anything else error. **weir never retries in place.** On a ladder-eligible kind (timeout, empty, quota), the next step gets a fresh worktree, `<ID>-s2`. One record covers the whole ladder: `attempts` lists every step, `branch`/`worktree`/`diff`/`checks` describe the last tree, and earlier trees are listed in `extra_branches`/`extra_worktrees` so cleanup and `task clean` remove them too. `--timeout` overrides every step; `--replica`/`--model` do not apply to a ladder.
 6. **Diff.** Run `git -C wt add -N . && git diff --stat <base>` and `git diff --binary <base> > tasks/ID/patch.diff`. The per-worktree index is writable by design.
 7. **Checks.** Each check runs as `agent-jail <wt> -- <cmd>` with its own timeout. It is sandboxed because it executes code the agent wrote. weir records the exit code and the last 60 lines of output.
 8. **Emit.** Append one ledger line and print one JSON record to stdout.

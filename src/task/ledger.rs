@@ -86,6 +86,10 @@ pub struct TaskRecord {
     pub diff: Option<DiffInfo>,
     pub checks: Vec<CheckResult>,
     pub cleanup: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_worktrees: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_branches: Option<Vec<String>>,
 }
 
 impl TaskRecord {
@@ -113,6 +117,8 @@ impl TaskRecord {
             diff: None,
             checks: Vec::new(),
             cleanup: String::new(),
+            extra_worktrees: None,
+            extra_branches: None,
         }
     }
 

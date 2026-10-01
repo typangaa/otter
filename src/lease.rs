@@ -47,7 +47,7 @@ const EXIT_SPAWN_FAILED: i32 = 126;
 /// Grace period between SIGTERM and SIGKILL when weir is interrupted.
 const TERM_GRACE: Duration = Duration::from_secs(10);
 /// Poll interval while waiting for a free slot.
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+pub const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Suffix of a lease lock file.
 const LOCK_SUFFIX: &str = ".lock";
 
@@ -789,8 +789,29 @@ pub fn status(json: bool) -> i32 {
         }
     };
 
+    let root = state_root();
+    let mut agy_cooldowns = std::collections::BTreeMap::new();
+    if let Some(r) = &root {
+        let cd = crate::task::cooldown::read_store(r);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (m, until_secs) in cd.agy {
+            if until_secs > now {
+                agy_cooldowns.insert(m, until_secs);
+            }
+        }
+    }
+
     if json {
-        match serde_json::to_string_pretty(&rows) {
+        let out = serde_json::json!({
+            "slots": rows,
+            "cooldowns": {
+                "agy": agy_cooldowns
+            }
+        });
+        match serde_json::to_string_pretty(&out) {
             Ok(text) => {
                 println!("{text}");
                 0
@@ -806,6 +827,17 @@ pub fn status(json: bool) -> i32 {
         }
         for row in &rows {
             print_human(row);
+        }
+        if !agy_cooldowns.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            for (m, until) in agy_cooldowns {
+                let remaining = until - now;
+                let mins = (remaining + 59) / 60;
+                println!("agy cooldown {mins}m (until unix {until}) for model {m}");
+            }
         }
         0
     }

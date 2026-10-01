@@ -63,18 +63,31 @@ pub struct TaskRunArgs {
     pub id: Option<String>,
 
     /// Worker to run: `pi` (local llama.cpp wrapper) or `agy` (cloud wrapper).
-    #[arg(long, value_name = "WORKER")]
-    pub worker: WorkerKind,
+    /// Exactly one of `--worker` or `--ladder` is required.
+    #[arg(
+        long,
+        value_name = "WORKER",
+        conflicts_with = "ladder",
+        required_unless_present = "ladder"
+    )]
+    pub worker: Option<WorkerKind>,
 
     /// Pi replica `auto|a|b`. Pi only; default `auto`.
-    #[arg(long, value_name = "REPLICA")]
+    #[arg(long, value_name = "REPLICA", conflicts_with = "ladder")]
     pub replica: Option<String>,
 
     /// Model id. Agy only; defaults to `[worker.agy] default_model`.
-    #[arg(long, value_name = "MODEL")]
+    #[arg(long, value_name = "MODEL", conflicts_with = "ladder")]
     pub model: Option<String>,
 
-    /// Wrapper timeout in seconds. Default: the worker's `timeout`.
+    /// Run the steps of `[ladder.NAME]` in order, moving to the next step only
+    /// on `timeout`, `empty` or `quota`. Each step gets a fresh worktree
+    /// (`<id>-s<N>`) unless the ladder sets `fresh_worktree_per_step = false`.
+    #[arg(long, value_name = "NAME", conflicts_with = "worker")]
+    pub ladder: Option<String>,
+
+    /// Wrapper timeout in seconds. Default: the worker's `timeout`. With
+    /// `--ladder` it overrides the timeout of every step.
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,
 
@@ -433,7 +446,8 @@ pub fn clean(cfg: &ConfigV2, args: &TaskCleanArgs, json: bool) -> i32 {
             skipped.push(skipped_row(&plan.id, &reason));
             continue;
         }
-        if let Err(err) = remove_task(&plan) {
+        let r = records.iter().find(|r| r.id == plan.id).unwrap();
+        if let Err(err) = remove_task(&plan, r) {
             removal_failed = true;
             skipped.push(skipped_row(&plan.id, &err));
             continue;
@@ -553,33 +567,42 @@ fn plan_for(record: &TaskRecord, selector: &Selector, wt_roots: &[PathBuf]) -> P
     plan
 }
 
-/// The rules that must hold before anything is removed: the branch is exactly
-/// `wt/<id>` and not a protected name, and the worktree lies strictly inside a
-/// configured `wt_root`.
+/// The rules that must hold before anything is removed, for the record's own
+/// tree and every ladder sibling in `extra_*`: each branch is `wt/<id>` or
+/// `wt/<id>-s<N>` and not a protected name, and each worktree lies strictly
+/// inside a configured `wt_root`.
 fn safety_check(record: &TaskRecord, worktree: &Path, wt_roots: &[PathBuf]) -> Result<(), String> {
-    let expected = format!("wt/{}", record.id);
-    if record.branch != expected {
+    check_tree(&record.id, &record.branch, worktree, wt_roots)?;
+    let branches = record.extra_branches.as_deref().unwrap_or_default();
+    let worktrees = record.extra_worktrees.as_deref().unwrap_or_default();
+    if branches.len() != worktrees.len() {
+        return Err("the record's extra_branches and extra_worktrees do not pair up".to_string());
+    }
+    for (branch, extra) in branches.iter().zip(worktrees) {
+        check_tree(&record.id, branch, Path::new(extra), wt_roots)?;
+    }
+    Ok(())
+}
+
+/// One `(branch, worktree)` pair of a task: see [`safety_check`].
+fn check_tree(id: &str, branch: &str, worktree: &Path, wt_roots: &[PathBuf]) -> Result<(), String> {
+    if !is_task_branch(id, branch) {
         return Err(format!(
-            "branch {} is not exactly {expected}",
-            record.branch
+            "branch {branch} is not exactly wt/{id} or a wt/{id}-s<N> ladder step"
         ));
     }
     // A recorded ref may be spelled as a full refname; strip it before the
     // protected-name test so `refs/heads/main` cannot sneak through.
-    let name = record
-        .branch
+    let name = branch
         .strip_prefix("refs/heads/")
-        .unwrap_or(&record.branch)
+        .unwrap_or(branch)
         .strip_prefix("wt/")
         .unwrap_or("");
     if name.is_empty() || name.contains('/') {
-        return Err(format!(
-            "branch {} is not a plain task branch",
-            record.branch
-        ));
+        return Err(format!("branch {branch} is not a plain task branch"));
     }
     if matches!(name, "main" | "master" | "develop") {
-        return Err(format!("branch {} is protected", record.branch));
+        return Err(format!("branch {branch} is protected"));
     }
     if worktree.as_os_str().is_empty() {
         return Err("the record has no worktree path".to_string());
@@ -592,6 +615,20 @@ fn safety_check(record: &TaskRecord, worktree: &Path, wt_roots: &[PathBuf]) -> R
             worktree.display()
         ))
     }
+}
+
+/// `wt/<id>`, or `wt/<id>-s<N>` with `N >= 2` for a later ladder step.
+fn is_task_branch(id: &str, branch: &str) -> bool {
+    let Some(rest) = branch.strip_prefix("wt/").and_then(|b| b.strip_prefix(id)) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    rest.strip_prefix("-s")
+        .filter(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+        .and_then(|n| n.parse::<u32>().ok())
+        .is_some_and(|n| n >= 2)
 }
 
 /// The canonical `wt_root` that strictly contains `worktree`.
@@ -629,19 +666,64 @@ fn inside_wt_root(worktree: &Path, wt_roots: &[PathBuf]) -> Option<PathBuf> {
 /// parent's ref store as `refs/worktree/<name>`: `branch -D` succeeds but that
 /// registration survives it, and only `prune` clears it — which is what makes
 /// `git branch --list` stop reporting the branch.
-fn remove_task(plan: &Plan) -> Result<(), String> {
-    git::worktree_remove(&plan.repo, &plan.worktree)?;
+fn remove_task(plan: &Plan, record: &TaskRecord) -> Result<(), String> {
+    let mut worktrees = vec![plan.worktree.clone()];
+    let mut branches = vec![plan.branch.clone()];
+    if let Some(extras) = &record.extra_worktrees {
+        for w in extras {
+            worktrees.push(std::path::PathBuf::from(w));
+        }
+    }
+    if let Some(extras) = &record.extra_branches {
+        for b in extras {
+            branches.push(b.clone());
+        }
+    }
+
+    // Try every tree before reporting, so one missing `-sN` sibling does not
+    // leave the others behind; the first error is returned at the end.
+    let mut first_err: Option<String> = None;
+    for worktree in &worktrees {
+        if let Err(e) = git::worktree_remove(&plan.repo, worktree) {
+            first_err.get_or_insert(e);
+        }
+    }
     // A worktree directory that was already deleted leaves its registration
     // behind, and git refuses `branch -D` on a branch it still lists as checked
     // out: prune before the delete, and once more after it.
     git::worktree_prune(&plan.repo)?;
-    git::branch_delete(&plan.repo, &plan.branch)?;
-    git::worktree_prune(&plan.repo)
+    for branch in &branches {
+        if let Err(e) = git::branch_delete(&plan.repo, branch) {
+            first_err.get_or_insert(e);
+        }
+    }
+    git::worktree_prune(&plan.repo)?;
+    first_err.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::inside_wt_root;
+    use super::{inside_wt_root, is_task_branch};
+
+    #[test]
+    fn task_branch_accepts_the_id_and_its_ladder_steps_only() {
+        let id = "20261001-fix-3fa2";
+        assert!(is_task_branch(id, "wt/20261001-fix-3fa2"));
+        assert!(is_task_branch(id, "wt/20261001-fix-3fa2-s2"));
+        assert!(is_task_branch(id, "wt/20261001-fix-3fa2-s10"));
+        for bad in [
+            "wt/20261001-fix-3fa2-s1",
+            "wt/20261001-fix-3fa2-s",
+            "wt/20261001-fix-3fa2-sx",
+            "wt/20261001-fix-3fa2x",
+            "wt/20261001-fix-3fa2/s2",
+            "wt/other",
+            "main",
+            "refs/heads/wt/20261001-fix-3fa2",
+        ] {
+            assert!(!is_task_branch(id, bad), "{bad} must be refused");
+        }
+    }
 
     #[test]
     fn wt_root_containment_is_strict_but_accepts_a_vanished_child() {

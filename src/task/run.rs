@@ -74,11 +74,25 @@ struct Plan {
     /// `wt_root/<id>`, deliberately *not* canonicalised: this exact string is
     /// handed to `git`, to `agent-jail` and into the record.
     worktree: PathBuf,
+    /// The workers to try, in order: one step for `--worker`, the ladder's
+    /// steps for `--ladder`.
+    steps: Vec<StepPlan>,
+    /// `[ladder.NAME] fresh_worktree_per_step` (always true for `--worker`).
+    fresh_worktree_per_step: bool,
+    /// Check names with their config, in the order given.
+    checks: Vec<(String, Check)>,
+    /// When to remove the worktree.
+    cleanup: Cleanup,
+}
+
+/// One worker attempt, validated in phase A: the `[worker.X]` facts flattened
+/// so the run loop does not care which worker or ladder step it came from.
+struct StepPlan {
     /// `pi` or `agy`.
     worker: &'static str,
     /// Requested replica for pi (`auto`, `a` or `b`); `None` for agy.
     replica: Option<String>,
-    /// Model for agy (`--model` or `default_model`); `None` for pi.
+    /// Model for agy (`--model`, the ladder step or `default_model`); `None` for pi.
     model: Option<String>,
     /// Wrapper timeout in seconds.
     timeout_secs: u64,
@@ -90,16 +104,14 @@ struct Plan {
     args_prefix: Vec<String>,
     /// Quota pattern for the exit-3 classification (agy only).
     quota_pattern: Option<String>,
-    /// Lease candidates: `(slot name, replica)`, in preference order.
+    /// Lease candidates: `(slot name, replica)`, in preference order. Empty for
+    /// agy, which takes no lease.
     candidates: Vec<(String, String)>,
-    /// Check names with their config, in the order given.
-    checks: Vec<(String, Check)>,
-    /// When to remove the worktree.
-    cleanup: Cleanup,
+    /// `[worker.agy] quota_cooldown` in seconds; `None` for pi.
+    quota_cooldown: Option<u64>,
 }
 
-/// The `[worker.X]` facts phase A needs, flattened so the rest of the plan
-/// does not care which worker was chosen.
+/// The `[worker.X]` table for one worker kind, after the exec allow-list check.
 #[derive(Clone)]
 struct WorkerTable {
     /// Wrapper program name (`pi-worker` / `agy-worker`).
@@ -116,6 +128,8 @@ struct WorkerTable {
     timeout: u64,
     /// `[worker.pi] slots` replica -> slot name.
     slots: BTreeMap<String, String>,
+    /// `[worker.agy] quota_cooldown` in seconds (agy only).
+    quota_cooldown: Option<u64>,
 }
 
 /// `--cleanup` policies.
@@ -145,72 +159,67 @@ fn build_plan(cfg_path: &Path, args: &TaskRunArgs) -> Result<Plan, String> {
     // 1. A version = 2 config.
     let cfg = cli::load_v2(cfg_path)?;
 
-    // 2. Worker flags must match the worker, before the table is consulted so
-    //    that `--model` with `pi` never depends on pi being configured.
-    let kind = args.worker;
-    match kind {
-        WorkerKind::Pi if args.model.is_some() => {
-            return Err(
-                "task run: --model does not apply to --worker pi (use --replica auto|a|b)"
-                    .to_string(),
-            );
-        }
-        WorkerKind::Agy if args.replica.is_some() => {
-            return Err(
-                "task run: --replica does not apply to --worker agy (use --model MODEL)"
-                    .to_string(),
-            );
-        }
-        _ => {}
+    // 2. Exactly one of --worker / --ladder. clap enforces this for the CLI;
+    //    the check stays so the plan is valid however `TaskRunArgs` was built.
+    //    --replica and --model are per worker, so they conflict with a ladder;
+    //    --timeout applies to every step.
+    if args.ladder.is_some() == args.worker.is_some() {
+        return Err("task run: exactly one of --worker or --ladder is required".to_string());
     }
-    let replica = match kind {
-        WorkerKind::Pi => Some(
-            args.replica
-                .clone()
-                .unwrap_or_else(|| REPLICA_AUTO.to_string()),
-        ),
-        WorkerKind::Agy => None,
-    };
-    if let Some(value) = replica.as_deref() {
-        check_substituted("--replica", value)?;
-        if value != REPLICA_AUTO && value != "a" && value != "b" {
-            return Err(format!(
-                "task run: --replica must be auto, a or b, got {value:?}"
-            ));
-        }
-    }
-    if let Some(value) = args.model.as_deref() {
-        check_substituted("--model", value)?;
+    if args.ladder.is_some() && (args.replica.is_some() || args.model.is_some()) {
+        return Err("task run: --replica and --model do not apply to --ladder".to_string());
     }
 
-    // 3. The `[worker.X]` table and the hard-coded exec allow-list.
-    let table = load_worker(kind, &cfg)?;
+    // 3. The steps: each one's `[worker.X]` table, the exec allow-list, its
+    //    flags and its timeout, all validated before anything runs.
+    let mut steps = Vec::new();
+    let mut fresh_worktree_per_step = true;
 
-    // 4. Timeout: `--timeout` wins, else the worker's; bounded either way.
-    let timeout_secs = match args.timeout {
-        Some(secs) => secs,
-        None => table.timeout,
-    };
-    if timeout_secs == 0 {
-        let source = if args.timeout.is_some() {
-            "--timeout".to_string()
-        } else {
-            format!("[worker.{}] timeout", kind.as_str())
+    if let Some(ladder_name) = &args.ladder {
+        let ladder_cfg = cfg.ladder.get(ladder_name).ok_or_else(|| {
+            format!(
+                "task run: unknown ladder {ladder_name} (known: {})",
+                known_names(cfg.ladder.keys())
+            )
+        })?;
+        fresh_worktree_per_step = ladder_cfg.fresh_worktree_per_step;
+
+        for step_str in &ladder_cfg.steps {
+            let (kind_str, arg_str) = step_str.split_once(':').ok_or_else(|| {
+                format!("task run: ladder step {step_str:?} must be worker:replica_or_model")
+            })?;
+            let kind = clap::ValueEnum::from_str(kind_str, true).map_err(|_| {
+                format!("task run: unknown worker kind {kind_str:?} in ladder step")
+            })?;
+            let replica_or_model = Some(arg_str.to_string());
+            steps.push(build_step_plan(kind, replica_or_model, args.timeout, &cfg)?);
+        }
+    } else if let Some(kind) = args.worker {
+        // Worker flags must match the worker, before the table is consulted so
+        // that `--model` with `pi` never depends on pi being configured.
+        match kind {
+            WorkerKind::Pi if args.model.is_some() => {
+                return Err(
+                    "task run: --model does not apply to --worker pi (use --replica auto|a|b)"
+                        .to_string(),
+                );
+            }
+            WorkerKind::Agy if args.replica.is_some() => {
+                return Err(
+                    "task run: --replica does not apply to --worker agy (use --model MODEL)"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        let replica_or_model = match kind {
+            WorkerKind::Pi => args.replica.clone(),
+            WorkerKind::Agy => args.model.clone(),
         };
-        return Err(format!("task run: timeout must be > 0 ({source})"));
-    }
-    if timeout_secs > MAX_TIMEOUT_SECS {
-        let source = if args.timeout.is_some() {
-            "--timeout".to_string()
-        } else {
-            format!("[worker.{}] timeout", kind.as_str())
-        };
-        return Err(format!(
-            "task run: timeout {timeout_secs} exceeds the maximum of {MAX_TIMEOUT_SECS} seconds ({source})"
-        ));
+        steps.push(build_step_plan(kind, replica_or_model, args.timeout, &cfg)?);
     }
 
-    // 5. Every --check must exist, in the order given.
+    // 4. Every --check must exist, in the order given.
     let mut checks = Vec::with_capacity(args.check.len());
     for name in &args.check {
         match cfg.check.get(name) {
@@ -219,14 +228,14 @@ fn build_plan(cfg_path: &Path, args: &TaskRunArgs) -> Result<Plan, String> {
                 return Err(format!(
                     "task run: no [check.{name}] in this config (known: {})",
                     known_names(cfg.check.keys())
-                ));
+                ))
             }
         }
     }
 
     let cleanup = Cleanup::parse(&args.cleanup)?;
 
-    // 6. Paths from the config, then the prompt (both needed for the id).
+    // 5. Paths from the config, then the prompt (both needed for the id).
     let state = cfg
         .state_dir_expanded()
         .map_err(|e| format!("task run: {e}"))?;
@@ -246,7 +255,7 @@ fn build_plan(cfg_path: &Path, args: &TaskRunArgs) -> Result<Plan, String> {
 
     let prompt = read_prompt(args)?;
 
-    // 7. The repository and its base revision.
+    // 6. The repository and its base revision.
     if !args.repo.is_dir() {
         return Err(format!(
             "task run: repo {} is not an existing directory",
@@ -269,24 +278,7 @@ fn build_plan(cfg_path: &Path, args: &TaskRunArgs) -> Result<Plan, String> {
         )
     })?;
 
-    // 8. The lease candidates, so an unusable slot map is also a phase A error.
-    let candidates = match kind {
-        WorkerKind::Pi => pi_candidates(replica.as_deref().unwrap_or(REPLICA_AUTO), &table.slots),
-        // agy takes no lease in P4; an empty list never reaches `acquire_slot`.
-        WorkerKind::Agy => Vec::new(),
-    };
-
     let id = decide_id(args, &tasks_dir, &repo, &wt_root)?;
-    let model = match kind {
-        WorkerKind::Agy => args.model.clone().or_else(|| table.default_model.clone()),
-        WorkerKind::Pi => None,
-    };
-    let args_prefix = match (&replica, &model) {
-        (Some(value), _) => expand_args(&table.replica_args, "replica", value),
-        (None, Some(value)) => expand_args(&table.model_args, "model", value),
-        // agy without --model and without default_model: no model arguments.
-        (None, None) => Vec::new(),
-    };
 
     Ok(Plan {
         state,
@@ -299,22 +291,13 @@ fn build_plan(cfg_path: &Path, args: &TaskRunArgs) -> Result<Plan, String> {
         branch: format!("wt/{id}"),
         worktree: wt_root.join(&id),
         id,
-        worker: kind.as_str(),
-        replica,
-        model,
-        timeout_secs,
-        program: table.command,
-        replica_args: table.replica_args.clone(),
-        args_prefix,
-        quota_pattern: table.quota_pattern,
-        candidates,
+        steps,
+        fresh_worktree_per_step,
         checks,
         cleanup,
     })
 }
 
-/// Read the `[worker.X]` table for the requested kind and re-check its command
-/// against the hard-coded allow-list (a hand-edited config is refused here).
 fn load_worker(kind: WorkerKind, cfg: &ConfigV2) -> Result<WorkerTable, String> {
     match kind {
         WorkerKind::Pi => {
@@ -331,6 +314,7 @@ fn load_worker(kind: WorkerKind, cfg: &ConfigV2) -> Result<WorkerTable, String> 
                 quota_pattern: None,
                 timeout: pi.timeout,
                 slots: pi.slots.clone(),
+                quota_cooldown: None,
             })
         }
         WorkerKind::Agy => {
@@ -352,6 +336,11 @@ fn load_worker(kind: WorkerKind, cfg: &ConfigV2) -> Result<WorkerTable, String> 
                 quota_pattern: Some(agy.quota_pattern.clone()),
                 timeout: agy.timeout,
                 slots: BTreeMap::new(),
+                quota_cooldown: Some(
+                    crate::config::v2::parse_duration(&agy.quota_cooldown)
+                        .map_err(|e| e.to_string())?
+                        .as_secs(),
+                ),
             })
         }
     }
@@ -521,191 +510,325 @@ async fn execute(plan: &Plan, json: bool) -> i32 {
         );
     }
 
-    // 2. The worktree.
-    if let Err(err) = git::worktree_add(&plan.repo, &plan.branch, &plan.worktree, &plan.base_commit)
-    {
-        return finish(
-            plan,
-            &mut record,
-            fail(ExitKind::Error, Some(err)),
-            started,
-            json,
-        );
-    }
+    let mut last_outcome_kind = ExitKind::Error;
+    let mut last_error = None;
+    let mut any_quota = false;
+    let mut last_was_quota = false;
+    // Every `(branch, worktree)` this run created, in step order. The last one
+    // is where the worker ran most recently: the diff, the checks and the
+    // record's `branch`/`worktree` describe it; the others become the record's
+    // `extra_*` fields so cleanup and `weir task clean` can find them.
+    let mut created: Vec<(String, PathBuf)> = Vec::new();
 
-    // 3. The slot lease (pi only). Held until the worker returns.
-    let (lease, queue_wait_ms) = match take_lease(plan).await {
-        Ok(guard) => guard,
-        Err(err) => {
-            return finish(
-                plan,
-                &mut record,
-                fail(ExitKind::Error, Some(err)),
-                started,
-                json,
-            )
+    for (i, step) in plan.steps.iter().enumerate() {
+        let is_last = i == plan.steps.len() - 1;
+
+        let step_id = if i == 0 || !plan.fresh_worktree_per_step {
+            plan.id.clone()
+        } else {
+            format!("{}-s{}", plan.id, i + 1)
+        };
+        let step_branch = format!("wt/{step_id}");
+        let step_worktree = plan.wt_root.join(&step_id);
+
+        record.worker = step.worker.to_string();
+        record.replica = step.replica.clone();
+        record.model = step.model.clone();
+
+        // An agy model that hit its quota recently is skipped without spawning
+        // anything; the attempt is still recorded so the ladder is auditable.
+        if step.worker == "agy" {
+            if let Some(model) = &step.model {
+                if crate::task::cooldown::is_cooling_down(&cooldown_root(plan), model) {
+                    record.attempts.push(Attempt {
+                        worker: step.worker.to_string(),
+                        replica: step.replica.clone(),
+                        model: step.model.clone(),
+                        exit: -1,
+                        kind: "skipped_cooldown".to_string(),
+                        queue_wait_ms: 0,
+                        elapsed_ms: 0,
+                        stderr_tail: String::new(),
+                        truncated: false,
+                    });
+                    last_outcome_kind = ExitKind::Quota;
+                    last_was_quota = true;
+                    any_quota = true;
+                    if !is_last {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
-    };
-    // The concrete replica the lease handed us, not the request (`auto`).
-    let replica = lease
-        .as_ref()
-        .map(|slot| slot.replica.clone())
-        .or_else(|| plan.replica.clone());
-    record.replica = replica.clone();
 
-    // 4. The worker. The lease drops the moment it returns.
-    let spec = WorkerSpec {
-        program: plan.program.clone(),
-        args_prefix: argv_for(plan, replica.as_deref()),
-        timeout_secs: plan.timeout_secs,
-        workdir: plan.worktree.clone(),
-        prompt_file: prompt_path.clone(),
-        quota_pattern: plan.quota_pattern.clone(),
-    };
-    let outcome = run_worker(&spec).await;
-    drop(lease);
-
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            record.attempts.push(Attempt {
-                worker: plan.worker.to_string(),
-                replica: replica.clone(),
-                model: plan.model.clone(),
-                // Nothing was spawned, so there is no wrapper code to report.
-                exit: -1,
-                kind: ExitKind::Error.as_str().to_string(),
-                queue_wait_ms,
-                elapsed_ms: 0,
-                stderr_tail: e.to_string(),
-                truncated: false,
-            });
-            return finish(
-                plan,
-                &mut record,
-                fail(
-                    ExitKind::Error,
-                    Some(format!("cannot start the worker: {e}")),
-                ),
-                started,
-                json,
-            );
+        // 2. The worktree: a fresh one per step (`<id>-s<N>` from step 2 on),
+        //    or the first one reused when the ladder says so. Reuse is only
+        //    reached after a timeout, empty or quota attempt.
+        if created.is_empty() || plan.fresh_worktree_per_step {
+            if let Err(err) =
+                git::worktree_add(&plan.repo, &step_branch, &step_worktree, &plan.base_commit)
+            {
+                return finish(
+                    plan,
+                    &mut record,
+                    fail(ExitKind::Error, Some(err)),
+                    started,
+                    json,
+                );
+            }
+            created.push((step_branch.clone(), step_worktree.clone()));
+            point_record_at(&mut record, &created);
         }
-    };
+        let workdir = created
+            .last()
+            .map(|(_, worktree)| worktree.clone())
+            .unwrap_or_else(|| step_worktree.clone());
 
-    record.attempts.push(Attempt {
-        worker: plan.worker.to_string(),
-        replica: replica.clone(),
-        model: plan.model.clone(),
-        exit: outcome.exit_code,
-        kind: outcome.kind.as_str().to_string(),
-        queue_wait_ms,
-        elapsed_ms: outcome.elapsed_ms,
-        stderr_tail: outcome.stderr_tail.clone(),
-        truncated: outcome.truncated,
-    });
-    record.queue_wait_ms = queue_wait_ms;
-    record.answer = cap_answer(&outcome.stdout);
+        // 3. The slot lease (pi only). Held until the worker returns.
 
-    // 5. Diff — whenever a worktree exists, whatever the worker did.
-    record.diff = capture_diff(plan, &prompt_path);
+        let (lease, queue_wait_ms) = match take_lease(plan, step).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                return finish(
+                    plan,
+                    &mut record,
+                    fail(ExitKind::Error, Some(err)),
+                    started,
+                    json,
+                );
+            }
+        };
 
-    // 6. Classify. Only a happy worker gets to the checks.
-    let outcome_kind = match outcome.kind {
-        // A wrapper usage error means weir built a bad argv: our bug, so 1,
-        // never the wrapper's 2 (which means "your command line was wrong").
-        ExitKind::Usage => ExitKind::Error,
-        other => other,
-    };
-    if outcome_kind != ExitKind::Ok {
-        let mut error = None;
+        let replica = lease
+            .as_ref()
+            .map(|slot| slot.replica.clone())
+            .or_else(|| step.replica.clone());
+        record.replica = replica.clone();
+
+        let spec = WorkerSpec {
+            program: step.program.clone(),
+            args_prefix: argv_for(step, replica.as_deref()),
+            timeout_secs: step.timeout_secs,
+            workdir: workdir.clone(),
+            prompt_file: prompt_path.clone(),
+            quota_pattern: step.quota_pattern.clone(),
+        };
+        // 4. The worker. The lease drops the moment it returns.
+        let outcome = run_worker(&spec).await;
+        drop(lease);
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                record.attempts.push(Attempt {
+                    worker: step.worker.to_string(),
+                    replica: replica.clone(),
+                    model: step.model.clone(),
+                    // Nothing was spawned, so there is no wrapper code to report.
+                    exit: -1,
+                    kind: ExitKind::Error.as_str().to_string(),
+                    queue_wait_ms,
+                    elapsed_ms: 0,
+                    stderr_tail: e.to_string(),
+                    truncated: false,
+                });
+                return finish(
+                    plan,
+                    &mut record,
+                    fail(
+                        ExitKind::Error,
+                        Some(format!("cannot start the worker: {e}")),
+                    ),
+                    started,
+                    json,
+                );
+            }
+        };
+
+        record.attempts.push(Attempt {
+            worker: step.worker.to_string(),
+            replica: replica.clone(),
+            model: step.model.clone(),
+            exit: outcome.exit_code,
+            kind: outcome.kind.as_str().to_string(),
+            queue_wait_ms,
+            elapsed_ms: outcome.elapsed_ms,
+            stderr_tail: outcome.stderr_tail.clone(),
+            truncated: outcome.truncated,
+        });
+        record.queue_wait_ms = queue_wait_ms;
+        record.answer = cap_answer(&outcome.stdout);
+
+        let outcome_kind = match outcome.kind {
+            // A wrapper usage error means weir built a bad argv: our bug, so 1,
+            // never the wrapper's 2 (which means "your command line was wrong").
+            ExitKind::Usage => ExitKind::Error,
+            other => other,
+        };
+
+        last_outcome_kind = outcome_kind;
         if outcome_kind == ExitKind::Error {
-            error = Some(if outcome.stderr_tail.trim().is_empty() {
+            last_error = Some(if outcome.stderr_tail.trim().is_empty() {
                 format!("{} exited with {}", spec.program, outcome.exit_code)
             } else {
                 outcome.stderr_tail.clone()
             });
+        } else {
+            last_error = None;
         }
-        return finish(plan, &mut record, fail(outcome_kind, error), started, json);
-    }
 
-    // 7. Checks, in the order given, all of them even after a failure.
-    let mut checks: Vec<CheckResult> = Vec::with_capacity(plan.checks.len());
-    let mut interrupted: Option<i32> = None;
-    if !plan.checks.is_empty() {
-        let mut interrupts = check::Interrupts::install();
-        for (name, def) in &plan.checks {
-            match interrupts.as_mut() {
-                Some(listener) => {
-                    let (row, sig) =
-                        check::run_check_interruptible(name, def, &plan.worktree, listener).await;
-                    checks.push(row);
-                    if sig.is_some() {
-                        interrupted = sig;
-                        break;
+        if outcome_kind == ExitKind::Quota {
+            any_quota = true;
+            last_was_quota = true;
+            if step.worker == "agy" {
+                if let Some(model) = &step.model {
+                    if let Some(cd) = step.quota_cooldown {
+                        crate::task::cooldown::set_cooldown(&cooldown_root(plan), model, cd);
                     }
                 }
-                None => checks.push(check::run_check(name, def, &plan.worktree).await),
+            }
+        } else {
+            last_was_quota = false;
+        }
+
+        // 5. Escalate only on outcomes another worker might fix. `denied`,
+        //    `jail_refused`, `error` and anything after a clean run stop here.
+        let is_escalate = matches!(
+            outcome_kind,
+            ExitKind::Timeout | ExitKind::Empty | ExitKind::Quota
+        );
+        if is_escalate && !is_last {
+            continue;
+        }
+
+        break;
+    }
+
+    // 6. Diff: whenever a worktree exists, whatever the worker did, so partial
+    //    work from a timeout is not lost.
+    let last_worktree = created.last().map(|(_, worktree)| worktree.clone());
+    if let Some(worktree) = &last_worktree {
+        record.diff = capture_diff(plan, worktree, &prompt_path);
+    }
+
+    // 7. Checks, in the order given, all of them even after a failure. Only a
+    //    happy worker gets here.
+    if let (ExitKind::Ok, Some(worktree)) = (last_outcome_kind, last_worktree.as_ref()) {
+        let mut checks: Vec<CheckResult> = Vec::with_capacity(plan.checks.len());
+        let mut interrupted: Option<i32> = None;
+        if !plan.checks.is_empty() {
+            let mut interrupts = check::Interrupts::install();
+            for (name, def) in &plan.checks {
+                match interrupts.as_mut() {
+                    Some(listener) => {
+                        let (row, sig) =
+                            check::run_check_interruptible(name, def, worktree, listener).await;
+                        checks.push(row);
+                        if sig.is_some() {
+                            interrupted = sig;
+                            break;
+                        }
+                    }
+                    None => checks.push(check::run_check(name, def, worktree).await),
+                }
             }
         }
+        record.checks = checks;
+        let failed = record.checks.iter().find(|row| row.exit != 0);
+        let classified = if let Some(sig) = interrupted {
+            // The remaining checks were not run; the record is still finished and
+            // logged so the interrupted run is not lost.
+            fail(
+                ExitKind::Error,
+                Some(format!(
+                    "interrupted by signal {sig} during check {}; remaining checks not run",
+                    record.checks.last().map_or("?", |row| row.name.as_str())
+                )),
+            )
+        } else {
+            match failed {
+                Some(row) => fail(
+                    ExitKind::CheckFailed,
+                    Some(format!("check {} exited with {}", row.name, row.exit)),
+                ),
+                None => (ExitKind::Ok, None),
+            }
+        };
+        return finish(plan, &mut record, classified, started, json);
     }
-    record.checks = checks;
-    let failed = record.checks.iter().find(|row| row.exit != 0);
-    let classified = if let Some(sig) = interrupted {
-        // The remaining checks were not run; the record is still finished and
-        // logged so the interrupted run is not lost.
-        fail(
-            ExitKind::Error,
-            Some(format!(
-                "interrupted by signal {sig} during check {}; remaining checks not run",
-                record.checks.last().map_or("?", |row| row.name.as_str())
-            )),
-        )
+
+    // Every step ran out of options. A quota anywhere on the way (rather than a
+    // worker that genuinely produced nothing) is reported as quota, exit 7.
+    let final_kind = if any_quota
+        && (last_was_quota
+            || matches!(
+                last_outcome_kind,
+                ExitKind::Timeout | ExitKind::Empty | ExitKind::Quota
+            )) {
+        ExitKind::Quota
     } else {
-        match failed {
-            Some(row) => fail(
-                ExitKind::CheckFailed,
-                Some(format!("check {} exited with {}", row.name, row.exit)),
-            ),
-            None => (ExitKind::Ok, None),
-        }
+        last_outcome_kind
     };
-    finish(plan, &mut record, classified, started, json)
+
+    finish(
+        plan,
+        &mut record,
+        fail(final_kind, last_error),
+        started,
+        json,
+    )
+}
+
+/// Where `cooldown.json` lives: the lease state root, so `weir lease status`
+/// (which reads no config) reports the same cooldowns `task run` honours.
+fn cooldown_root(plan: &Plan) -> PathBuf {
+    crate::lease::state_root().unwrap_or_else(|| plan.state.clone())
+}
+
+/// Point the record's `branch`/`worktree` at the newest tree and list the
+/// earlier ones as `extra_*`, so the record always names every tree to clean.
+fn point_record_at(record: &mut TaskRecord, created: &[(String, PathBuf)]) {
+    let Some(((branch, worktree), earlier)) = created.split_last() else {
+        return;
+    };
+    record.branch = branch.clone();
+    record.worktree = worktree.display().to_string();
+    if earlier.is_empty() {
+        record.extra_branches = None;
+        record.extra_worktrees = None;
+    } else {
+        record.extra_branches = Some(earlier.iter().map(|(b, _)| b.clone()).collect());
+        record.extra_worktrees = Some(
+            earlier
+                .iter()
+                .map(|(_, w)| w.display().to_string())
+                .collect(),
+        );
+    }
 }
 
 /// The argv before `-t <secs>`. For pi it is rebuilt from the template with
 /// the replica the lease actually granted (`auto` resolves at that point);
 /// agy uses the model argv built in phase A.
-fn argv_for(plan: &Plan, replica: Option<&str>) -> Vec<String> {
+fn argv_for(step: &StepPlan, replica: Option<&str>) -> Vec<String> {
     match replica {
-        Some(value) => expand_args(&plan.replica_args, "replica", value),
-        None => plan.args_prefix.clone(),
+        Some(value) => expand_args(&step.replica_args, "replica", value),
+        None => step.args_prefix.clone(),
     }
 }
 
-/// Length of the longest prefix of `text` of at most [`AFFINITY_PROMPT_BYTES`]
-/// bytes that ends on a char boundary.
-fn prefix_len(text: &str) -> usize {
-    if text.len() <= AFFINITY_PROMPT_BYTES {
-        return text.len();
-    }
-    let mut end = AFFINITY_PROMPT_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
-}
-
-/// Acquire the slot lease. Returns `(guard, queue_wait_ms)`; the guard is
-/// `None` for a worker that takes no lease.
-async fn take_lease(plan: &Plan) -> Result<(Option<SlotLease>, u64), String> {
-    if plan.candidates.is_empty() {
+/// Acquire the slot lease for `step`. Returns `(guard, queue_wait_ms)`; the
+/// guard is `None` for a worker that takes no lease.
+async fn take_lease(plan: &Plan, step: &StepPlan) -> Result<(Option<SlotLease>, u64), String> {
+    if step.candidates.is_empty() {
         return Ok((None, 0));
     }
     // The same root `weir lease run` locks under, so both queueing paths share
     // one lock file per slot whatever `paths.state_dir` says.
     let root = crate::lease::state_root().unwrap_or_else(|| plan.state.clone());
-    let candidates = plan.candidates.clone();
+    let candidates = step.candidates.clone();
     let affinity = Some(affinity_key(plan));
     // `holder` is only written into the lock file for `weir lease status`.
     let holder = vec![
@@ -728,6 +851,16 @@ async fn take_lease(plan: &Plan) -> Result<(Option<SlotLease>, u64), String> {
     }
 }
 
+/// Length of the longest prefix of `text` of at most [`AFFINITY_PROMPT_BYTES`]
+/// bytes that ends on a char boundary.
+fn prefix_len(text: &str) -> usize {
+    let mut len = text.len().min(AFFINITY_PROMPT_BYTES);
+    while len > 0 && !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
 /// The lease affinity key: hex of a hash over the canonical repo path plus the
 /// first 2 KiB of the prompt, so the same work keeps the same replica warm.
 fn affinity_key(plan: &Plan) -> String {
@@ -740,17 +873,18 @@ fn affinity_key(plan: &Plan) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// `git diff` counts plus the patch file, or `None` when there is no worktree.
-fn capture_diff(plan: &Plan, prompt_path: &Path) -> Option<DiffInfo> {
-    if !plan.worktree.exists() {
+/// `git diff` counts plus the patch file for `worktree`, or `None` when the
+/// worktree does not exist.
+fn capture_diff(plan: &Plan, worktree: &Path, prompt_path: &Path) -> Option<DiffInfo> {
+    if !worktree.exists() {
         return None;
     }
-    let (files, insertions, deletions) = git::diff_stat(&plan.worktree, &plan.base_commit);
+    let (files, insertions, deletions) = git::diff_stat(worktree, &plan.base_commit);
     let patch_path = prompt_path
         .parent()
         .map(|dir| dir.join("patch.diff"))
         .unwrap_or_else(|| plan.tasks_dir.join(&plan.id).join("patch.diff"));
-    match git::write_patch(&plan.worktree, &plan.base_commit, &patch_path) {
+    match git::write_patch(worktree, &plan.base_commit, &patch_path) {
         Ok(_) => Some(DiffInfo {
             files,
             insertions,
@@ -770,9 +904,13 @@ fn new_record(plan: &Plan) -> TaskRecord {
     record.base_commit = plan.base_commit.clone();
     record.branch = plan.branch.clone();
     record.worktree = plan.worktree.display().to_string();
-    record.worker = plan.worker.to_string();
-    record.replica = plan.replica.clone();
-    record.model = plan.model.clone();
+    // Step 1's worker, so a run that fails before any attempt still says what
+    // it was going to run; the loop overwrites these per step.
+    if let Some(first) = plan.steps.first() {
+        record.worker = first.worker.to_string();
+        record.replica = first.replica.clone();
+        record.model = first.model.clone();
+    }
     record.created_at = cli::now_unix();
     record
 }
@@ -804,7 +942,7 @@ fn finish(
         Cleanup::OnSuccess => kind == ExitKind::Ok,
     };
     record.cleanup = if should_remove {
-        match remove_worktree(plan) {
+        match remove_worktree(plan, record) {
             Ok(()) => "removed".to_string(),
             Err(err) => {
                 // The tree is still there: report it as kept, with the reason.
@@ -841,14 +979,37 @@ fn finish(
 /// The three calls are sequential and never interleaved with another task's git
 /// calls in the same repository, which a shared lock would guarantee but which
 /// also follows from the fact that a single run owns its own `wt/<id>` branch.
-fn remove_worktree(plan: &Plan) -> Result<(), String> {
-    git::worktree_remove(&plan.repo, &plan.worktree)?;
+///
+/// A ladder run can own several trees (`<id>`, `<id>-s2`, ...): every one named
+/// in the record is removed, and the first error is reported after all of them
+/// were attempted.
+fn remove_worktree(plan: &Plan, record: &TaskRecord) -> Result<(), String> {
+    let mut trees = vec![(record.branch.clone(), PathBuf::from(&record.worktree))];
+    if let (Some(branches), Some(worktrees)) = (&record.extra_branches, &record.extra_worktrees) {
+        trees.extend(
+            branches
+                .iter()
+                .cloned()
+                .zip(worktrees.iter().map(PathBuf::from)),
+        );
+    }
+    let mut first_err: Option<String> = None;
+    for (_, worktree) in &trees {
+        if let Err(e) = git::worktree_remove(&plan.repo, worktree) {
+            first_err.get_or_insert(e);
+        }
+    }
     // A worktree directory that was already deleted leaves its registration
     // behind, and git refuses `branch -D` on a branch it still lists as checked
     // out: prune before the delete, and once more after it.
     git::worktree_prune(&plan.repo)?;
-    git::branch_delete(&plan.repo, &plan.branch)?;
-    git::worktree_prune(&plan.repo)
+    for (branch, _) in &trees {
+        if let Err(e) = git::branch_delete(&plan.repo, branch) {
+            first_err.get_or_insert(e);
+        }
+    }
+    git::worktree_prune(&plan.repo)?;
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Print the record: one JSON line and nothing else, or the answer plus one
@@ -891,4 +1052,83 @@ fn cap_answer(text: &str) -> String {
         end -= 1;
     }
     text[..end].to_string()
+}
+
+/// Validate one step, `--worker` or a ladder entry, into a [`StepPlan`].
+///
+/// `replica_or_model` is the replica for pi and the model for agy;
+/// `timeout_override` is `--timeout`. The `[worker.X]` table is read here, so
+/// a hand-edited command outside the allow-list is refused for ladder steps too.
+fn build_step_plan(
+    kind: WorkerKind,
+    replica_or_model: Option<String>,
+    timeout_override: Option<u64>,
+    cfg: &ConfigV2,
+) -> Result<StepPlan, String> {
+    let replica = match kind {
+        WorkerKind::Pi => Some(
+            replica_or_model
+                .clone()
+                .unwrap_or_else(|| REPLICA_AUTO.to_string()),
+        ),
+        WorkerKind::Agy => None,
+    };
+    if let Some(value) = replica.as_deref() {
+        check_substituted("--replica", value)?;
+        if value != REPLICA_AUTO && value != "a" && value != "b" {
+            return Err(format!(
+                "task run: --replica must be auto, a or b, got {value:?}"
+            ));
+        }
+    }
+    if kind == WorkerKind::Agy {
+        if let Some(value) = replica_or_model.as_deref() {
+            check_substituted("--model", value)?;
+        }
+    }
+
+    let table = load_worker(kind, cfg)?;
+    let timeout_secs = match timeout_override {
+        Some(secs) => secs,
+        None => table.timeout,
+    };
+
+    let source = if timeout_override.is_some() {
+        "--timeout".to_string()
+    } else {
+        format!("[worker.{}] timeout", kind.as_str())
+    };
+
+    if timeout_secs == 0 {
+        return Err(format!("task run: timeout must be > 0 ({source})"));
+    }
+    if timeout_secs > MAX_TIMEOUT_SECS {
+        return Err(format!("task run: timeout {timeout_secs} exceeds the maximum of {MAX_TIMEOUT_SECS} seconds ({source})"));
+    }
+
+    let model = match kind {
+        WorkerKind::Agy => replica_or_model.or_else(|| table.default_model.clone()),
+        WorkerKind::Pi => None,
+    };
+    let args_prefix = match (&replica, &model) {
+        (Some(value), _) => expand_args(&table.replica_args, "replica", value),
+        (None, Some(value)) => expand_args(&table.model_args, "model", value),
+        (None, None) => Vec::new(),
+    };
+    let candidates = match kind {
+        WorkerKind::Pi => pi_candidates(replica.as_deref().unwrap_or(REPLICA_AUTO), &table.slots),
+        WorkerKind::Agy => Vec::new(),
+    };
+    Ok(StepPlan {
+        worker: kind.as_str(),
+        replica,
+        model,
+        timeout_secs,
+        program: table.command,
+        replica_args: table.replica_args.clone(),
+        args_prefix,
+        quota_pattern: table.quota_pattern,
+        candidates,
+        quota_cooldown: table.quota_cooldown,
+    })
 }
