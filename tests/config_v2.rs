@@ -456,16 +456,35 @@ fn validate_rejects_bad_v2_configs() {
 
 // ── validate --deep ───────────────────────────────────────────────────────────
 
+/// Write an executable script robustly: write to a temporary file in the same
+/// directory, sync_all, drop the file, chmod 755, and rename into place.
+/// This prevents ETXTBSY when other test threads fork concurrently.
+fn write_executable(path: &Path, contents: &str) {
+    use std::io::Write;
+
+    let parent = path.parent().expect("parent dir");
+    std::fs::create_dir_all(parent).unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap();
+    let tmp = parent.join(format!("{name}.tmp"));
+    let mut file =
+        std::fs::File::create(&tmp).unwrap_or_else(|e| panic!("create {}: {e}", tmp.display()));
+    file.write_all(contents.as_bytes())
+        .unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
+    file.sync_all()
+        .unwrap_or_else(|e| panic!("sync {}: {e}", tmp.display()));
+    drop(file);
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&tmp, path)
+        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), path.display()));
+}
+
 /// Create an executable `#!/bin/sh` script named `name` in `dir`.
 ///
-/// Written to a temporary name, made executable, then renamed into place:
+/// Written to a temporary name, synced, closed, made executable, then renamed into place:
 /// chmod-ing a script that another thread is spawning can fail with ETXTBSY.
 fn make_bin(dir: &Path, name: &str, body: &str) -> PathBuf {
     let script = dir.join(name);
-    let tmp = dir.join(format!("{name}.tmp"));
-    write(&tmp, &format!("#!/bin/sh\n{body}\n"));
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::rename(&tmp, &script).unwrap();
+    write_executable(&script, &format!("#!/bin/sh\n{body}\n"));
     script
 }
 
@@ -496,7 +515,7 @@ fn deep_fixture(with_extra_root: bool) -> DeepFixture {
     } else {
         "WT_ROOTS=(\"$HOME/wt-a\")"
     };
-    write(
+    write_executable(
         &jail,
         &format!(
             "#!/bin/bash\n# agent-jail fixture\n{jail_roots}\nexec bwrap --ro-bind / / \"$@\"\n"
@@ -692,7 +711,7 @@ fn deep_fails_when_agent_jail_script_is_missing() {
 #[test]
 fn deep_fails_when_agent_jail_has_no_wt_roots_array() {
     let dir = deep_fixture(false);
-    write(
+    write_executable(
         &dir.jail,
         "#!/bin/bash\n# no array here\nexec bwrap \"$@\"\n",
     );
@@ -796,8 +815,30 @@ fn deep_uses_the_real_bwrap_when_weir_bwrap_is_unset() {
 #[test]
 fn fixture_bins_are_executable() {
     let dir = deep_fixture(false);
-    let status = StdCommand::new(dir.bin.join("pi-worker")).status().unwrap();
+    let bin = dir.bin.join("pi-worker");
+    let mut last_err = None;
+    let mut status = None;
+    for _ in 0..20 {
+        match StdCommand::new(&bin).status() {
+            Ok(s) => {
+                status = Some(s);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("exec {}: {e}", bin.display()),
+        }
+    }
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "exec {} timed out waiting for ETXTBSY to clear: {:?}",
+            bin.display(),
+            last_err
+        )
+    });
     assert!(status.success());
-    let e = std::fs::metadata(dir.bin.join("pi-worker")).unwrap();
+    let e = std::fs::metadata(&bin).unwrap();
     assert_ne!(e.permissions().mode() & 0o111, 0);
 }
