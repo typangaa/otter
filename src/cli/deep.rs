@@ -535,12 +535,24 @@ fn run_capturing_with_timeout(
     args: &[&str],
     limit: std::time::Duration,
 ) -> std::io::Result<(Option<i32>, String, String)> {
-    let mut child = Command::new(pgm)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    // A script that was just written can briefly fail to exec with ETXTBSY
+    // while a concurrently forked process still holds its write fd; retry.
+    let mut attempts = 0;
+    let mut child = loop {
+        match Command::new(pgm)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => break other?,
+        }
+    };
 
     // Take both pipes out of the child so they can be drained from helper
     // threads; dropping them closes the write end and unblocks the child.

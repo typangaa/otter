@@ -1,125 +1,86 @@
-# CLAUDE.md — weir project
+# CLAUDE.md
 
-## Build & test
+weir v1: a task runner and GPU slot scheduler for jailed CLI agent workers
+(single Rust binary, no HTTP/MCP/server/API keys). See `DESIGN.md` and
+`docs/design-v1.md`.
 
-```sh
-source "$HOME/.cargo/env"            # activate rustup if needed
-cargo build                          # dev build
-cargo build --release                # optimised (~1.6 MB stripped binary)
-cargo test                           # 71 unit tests — must all pass
-cargo clippy --all-targets -- -D warnings   # zero warnings policy
-cargo fmt --all                      # format; CI runs `cargo fmt --all --check`
+## Build and test
+
+Always build to a target dir outside the repo (the repo may live on a slow or
+synced filesystem):
+
+```bash
+source $HOME/.cargo/env
+export CARGO_TARGET_DIR=$HOME/.cache/weir-target
+cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo build --release --locked          # binary: $CARGO_TARGET_DIR/release/weir
 ```
 
-## Formatting style
+Style: default rustfmt, zero clippy warnings, English only in code, docs,
+commits and branch names.
 
-Code is formatted with **default `rustfmt`** (no `rustfmt.toml` — 100-col,
-struct literals expanded multi-line). Run `cargo fmt --all` before committing;
-the CI `fmt` job fails the build on any drift (`cargo fmt --all --check`). Do
-not hand-compact struct literals or call chains against rustfmt's output — let
-the formatter decide. All four gates (fmt / clippy / test / release build) run
-on every push and PR via `.github/workflows/ci.yml`.
+## Smoke tests
 
-Binary after release build: `target/release/weir`  
-Installed binary: `~/.local/bin/weir` (copy manually after build)
-
-```sh
-cp target/release/weir ~/.local/bin/weir
+```bash
+W=$CARGO_TARGET_DIR/release/weir
+$W --version
+$W validate --config examples/weir.v2.example.toml --json
+$W schema
+$W lease status --json
+$W task list --json
 ```
 
-## Smoke tests after changes
+Live smoke (needs the real `pi-worker`, `agent-jail` and a llama.cpp replica):
 
-```sh
-weir --version
-weir validate --config weir.example.toml --json
-weir --config weir.example.toml backend list --json
-weir --config ~/.config/weir/weir.toml backend test agy --json
-weir --config ~/.config/weir/weir.toml chat agy "ping" 2>/dev/null
+```bash
+R=/tmp/pilot/weir-smoke-repo
+rm -rf $R && mkdir -p $R && git -C $R init -q -b main
+echo '# smoke' > $R/README.md && git -C $R add . && git -C $R commit -qm init
+echo 'Create hello.txt containing the line: hello. Do nothing else.' > /tmp/pilot/smoke.md
+$W task run --repo $R --base main --worker pi --timeout 400 \
+  --prompt-file /tmp/pilot/smoke.md --json     # expect exit 0, diff.files == 1
+$W task clean <id>
 ```
 
-## Architecture in one paragraph
+## Hard rules
 
-Config lives in `weir.toml` (TOML, single source of truth), loaded once per
-invocation via `Config::load` then run through the 3-layer validator. There is a
-single `Backend` implementation, `StdioCliBackend` (tokio::process oneshot,
-**stdin always set to null** — critical so spawned children never inherit the
-parent's stdin pipe): weir orchestrates local CLI agents and is neither an HTTP
-client nor an HTTP server. Engines (`fan_out`, `pipeline`, `router`,
-`eval_loop`, `fusion`) compose backends into workflows. `fusion` runs a 3-phase
-deliberation: panel fan-out → judge JSON analysis
-(consensus/contradictions/unique_insights/blind_spots) → synthesizer final
-answer. weir is a short-lived CLI process only (`weir chat`, `weir workflow
-run`, …) — there is no server mode.
+- No HTTP client or server, no MCP, no daemon, no API keys.
+- Only exec `pi-worker`, `agy-worker` (allow-list hard-coded), `agent-jail`, `git`.
+- `stdin` is null on every spawn except the prompt pipe.
+- weir never commits, merges or pushes; the caller does.
+- Unknown config keys are an error; never search `./weir.toml`.
+- Do not rename env vars (`WEIR_CONFIG`), config paths (`~/.config/weir/weir.toml`),
+  state dirs or the ledger schema id (`weir.task/1`) without a dedicated change.
 
-## Module map
+## Architecture
 
-```
-src/
-├── main.rs            CLI entry (clap), dispatch, run_chat, run_workflow
-├── error.rs           WeirError enum, Result<T> alias
-├── config/
-│   ├── mod.rs         Config / BackendConfig / WorkflowConfig (serde)
-│   └── validate.rs    3-layer validation (syntactic → semantic → resilience)
-├── backends/
-│   ├── mod.rs         Backend trait, ChatRequest/Response/Message
-│   └── stdio_cli.rs   tokio::process oneshot (stdin=null!) — the only backend
-├── engine/
-│   ├── fan_out.rs     JoinSet parallel dispatch
-│   ├── pipeline.rs    sequential chain + {{step.output}} template substitution
-│   ├── router.rs      single backend explicit pick
-│   ├── eval_loop.rs   generator ↔ evaluator iteration until PASS
-│   └── fusion.rs      panel fan-out → judge JSON analysis → synthesizer
-├── resilience/        CircuitBreaker, RetryPolicy, RateLimiter (+ ResilientBackend decorator, wired v0.2)
-├── cli/
-│   ├── backend.rs     backend list/test/add/remove (toml_edit write-back)
-│   ├── workflow.rs    workflow list/add/remove
-│   ├── validate.rs    validate_config (`weir validate`)
-│   └── status.rs      version, schema
-└── observability/
-    ├── metrics.rs     per-backend AtomicU64 counters (wired v0.2; persisted to ~/.local/state/weir/metrics.json)
-    ├── persist.rs     merge-on-write metrics snapshot (atomic rename), read by `weir status`
-    └── tracing_setup.rs  tracing-subscriber (json or pretty → stderr)
-```
+Config v2 (`version = 2`) declares paths, slots, workers, ladders and checks.
+`task run` = admit, worktree, lease, spawn wrapper in a process group, classify
+exit code, optional ladder, diff, jailed checks, ledger line, cleanup.
 
-## Hard constraints — never violate
+| Path | Role |
+|---|---|
+| `src/main.rs` | clap dispatch, config resolution, exit codes |
+| `src/config/{resolve,v2}.rs` | path resolution; v2 schema and validation |
+| `src/cli/{validate,status,deep}.rs` | validate, `--deep` probes, status, schema |
+| `src/exit.rs` | `ExitKind` classification of wrapper exits |
+| `src/lease.rs` | flock leases, `lease run/status` |
+| `src/worker/{spawn,cli}.rs` | process-group spawn, caps, deadlines; `worker run` |
+| `src/task/run.rs` | task lifecycle and ladder |
+| `src/task/{git,check,id,cooldown,ledger,cli}.rs` | worktrees/diffs, jailed checks, ids, quota cooldown, JSONL ledger, CLI |
+| `src/observability/` | tracing setup |
+| `tests/` | `assert_cmd` integration tests: `cli`, `config_v2`, `task_run`, `worker_spawn` |
+| `docs/archive/` | superseded v0 plans (history only) |
 
-1. **weir is a CLI-agent orchestrator only — no HTTP client, no HTTP server, no
-   MCP server, no API keys.** The single backend type is `stdio-cli`. weir never
-   opens a network socket to call an LLM, never listens on a port, and never
-   reads/stores/forwards a secret. Every agent CLI (hermes/claude/agy/gemini/ollama)
-   the user installs and logs in themselves owns its own credentials and network
-   access. Never add an `openai-compat`/HTTP backend, an `api_key`/`api_key_env`
-   field, an HTTP transport, or an MCP/server mode.
+## Release process
 
-2. **`StdioCliBackend` must set `.stdin(Stdio::null())`** on every spawned
-   process. Without this, `tokio::process` children inherit the parent's stdin
-   pipe and block indefinitely waiting for input (the original symptom that hit
-   the now-removed MCP server; keep the guard regardless).
-
-3. **Validate before use**: every config load runs `validate::validate` →
-   syntactic → semantic → resilience. `weir validate` surfaces failures; other
-   commands fail fast on a bad config.
-
-## Non-goals (deliberately out of scope)
-
-- **HTTP client backends** (`openai-compat` / `/v1/chat/completions`): removed in
-  v0.3. To reach an HTTP-only model server, wrap it in a CLI (e.g. `ollama run`).
-- **HTTP transport / serving over a port** (axum, streamable-http): never. weir
-  opens no network socket.
-- **MCP server / `weir serve`**: removed in v0.4. weir is a short-lived CLI; it
-  exposes its full surface through subcommands, not an MCP tool server.
-
-## Dependency notes
-
-- `toml_edit 0.25` — comment-preserving TOML write-back for `weir backend add`
-  and `weir workflow add`.
-- `clap 4` — CLI parsing (derive). `tracing` + `tracing-subscriber` — logs to
-  stderr (pretty or json), initialized for every command.
-
-## Claude Code integration
-
-**Skill** (at `~/.claude/skills/weir/SKILL.md`):
-Invoke with `/weir`. Teaches Claude to call `weir chat` / `weir workflow run`
-directly from Bash. This is the only integration — there is no MCP server.
-
-Live config: `~/.config/weir/weir.toml`
+1. Branch, bump `version` in `Cargo.toml`, refresh `Cargo.lock`
+   (`cargo build --locked` must pass), add a `## [X.Y.Z] - YYYY-MM-DD` section to
+   `CHANGELOG.md`.
+2. Open a PR and merge it to `main` (never push to main directly).
+3. Tag the merge commit on `main`: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+4. `.github/workflows/release.yml` verifies the tag matches `Cargo.toml`, runs
+   fmt/clippy/test, builds the Linux binary and publishes the tarball plus
+   checksum with notes extracted from `CHANGELOG.md`.

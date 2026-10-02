@@ -733,7 +733,7 @@ timeout_secs = 60
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("requires a version = 2 config"),
+        String::from_utf8_lossy(&out.stderr).contains("missing 'version = 2'"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

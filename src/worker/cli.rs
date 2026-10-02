@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 
-use crate::config::v2::{load_any, AnyConfig, ConfigV2};
+use crate::config::v2::ConfigV2;
 use crate::worker::spawn::{
     check_program_allowed, expand_args, run_worker, WorkerOutcome, WorkerSpec, MAX_TIMEOUT_SECS,
 };
@@ -105,17 +105,8 @@ pub async fn run(cfg_path: &Path, args: &WorkerRunArgs, json: bool) -> i32 {
             &format!("config file not found: {}", cfg_path.display()),
         );
     }
-    let cfg = match load_any(cfg_path) {
-        Ok(AnyConfig::V2(cfg)) => cfg,
-        Ok(AnyConfig::Legacy(_)) => {
-            return usage_error(
-                json,
-                &format!(
-                    "worker run requires a version = 2 config ({})",
-                    cfg_path.display()
-                ),
-            )
-        }
+    let cfg = match ConfigV2::load(cfg_path) {
+        Ok(cfg) => cfg,
         Err(e) => return usage_error(json, &format!("{e}")),
     };
 

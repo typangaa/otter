@@ -1,6 +1,94 @@
-//! CLI subcommands: `weir status …` (schema, version)
+//! CLI subcommands: `weir status`, `weir version`, `weir schema`.
+
+use std::path::Path;
 
 use serde_json::json;
+
+use crate::config::v2::ConfigV2;
+
+// ── status ────────────────────────────────────────────────────────────────────
+
+/// Print a summary of the v2 config: workers, slots, ladders, checks and any
+/// active agy quota cooldowns recorded under `paths.state_dir`.
+///
+/// For live lease occupancy use `weir lease status`.
+pub fn show_status(cfg: &ConfigV2, path: &Path, json: bool) {
+    let state_dir = cfg.state_dir_expanded().ok();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cooldowns: Vec<(String, i64)> = state_dir
+        .as_deref()
+        .map(|d| crate::task::cooldown::read_store(d).agy)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, until)| *until > now)
+        .collect();
+
+    let workers: Vec<&str> = {
+        let mut v: Vec<&str> = cfg.worker.defined_set().into_iter().collect();
+        v.sort_unstable();
+        v
+    };
+
+    if json {
+        let slots: serde_json::Map<String, serde_json::Value> = cfg
+            .slots
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v.capacity)))
+            .collect();
+        let ladders: serde_json::Map<String, serde_json::Value> = cfg
+            .ladder
+            .iter()
+            .map(|(k, v)| (k.clone(), json!(v.steps)))
+            .collect();
+        let cds: serde_json::Map<String, serde_json::Value> = cooldowns
+            .iter()
+            .map(|(m, until)| (m.clone(), json!(until)))
+            .collect();
+        println!(
+            "{}",
+            json!({
+                "status": "ok",
+                "version": 2,
+                "path": path.display().to_string(),
+                "workers": workers,
+                "slots": slots,
+                "ladders": ladders,
+                "checks": cfg.check.keys().collect::<Vec<_>>(),
+                "state_dir": state_dir.as_ref().map(|d| d.display().to_string()),
+                "cooldowns": { "agy": cds },
+            })
+        );
+        return;
+    }
+
+    println!("Config:    {} (version 2)", path.display());
+    println!("Workers:   {} configured", workers.len());
+    for w in &workers {
+        println!("  - {w}");
+    }
+    println!("Slots:     {} configured", cfg.slots.len());
+    for (name, slot) in &cfg.slots {
+        println!("  - {:<12} capacity {}", name, slot.capacity);
+    }
+    println!("Ladders:   {} configured", cfg.ladder.len());
+    for (name, ladder) in &cfg.ladder {
+        println!("  - {}: {}", name, ladder.steps.join(" -> "));
+    }
+    println!("Checks:    {} configured", cfg.check.len());
+    for name in cfg.check.keys() {
+        println!("  - {name}");
+    }
+    if let Some(d) = &state_dir {
+        println!("State dir: {}", d.display());
+    }
+    for (model, until) in &cooldowns {
+        let mins = (until - now + 59) / 60;
+        println!("agy cooldown {mins}m (until unix {until}) for model {model}");
+    }
+}
 
 // ── version ───────────────────────────────────────────────────────────────────
 
@@ -30,11 +118,10 @@ pub fn show_version(json: bool) {
 
 // ── schema ────────────────────────────────────────────────────────────────────
 
-/// Print the JSON Schema for `weir.toml` (`Config`).
+/// Print the JSON Schema for `weir.toml` (the `version = 2` schema).
 ///
 /// The schema is inlined as a [`serde_json::json!`] literal so the binary
-/// carries no extra dependencies and the output is always consistent with
-/// the code.
+/// carries no extra dependencies.
 pub fn show_schema(json_flag: bool) {
     let schema = build_schema();
 
@@ -52,129 +139,135 @@ pub fn show_schema(json_flag: bool) {
 fn build_schema() -> serde_json::Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id":     "https://github.com/typangaa/otterbridge/weir.toml.schema.json",
-        "title":   "WeirConfig",
-        "description": "Top-level weir.toml configuration file for the weir CLI agent orchestrator.",
+        "$id":     "https://github.com/typangaa/otter/weir.toml.schema.json",
+        "title":   "WeirConfigV2",
+        "description": "weir.toml (version = 2): task runner and GPU slot scheduler for jailed workers.",
         "type": "object",
+        "required": ["version"],
+        "additionalProperties": false,
         "properties": {
-            "backend": {
-                "description": "Array of backend definitions (TOML: [[backend]]).",
-                "type": "array",
-                "items": {
-                    "$ref": "#/$defs/BackendConfig"
+            "version": {
+                "const": 2,
+                "description": "Config schema version; must be 2."
+            },
+            "paths": { "$ref": "#/$defs/Paths" },
+            "slots": {
+                "type": "object",
+                "description": "[slots.NAME] lease slots.",
+                "additionalProperties": { "$ref": "#/$defs/Slot" }
+            },
+            "worker": {
+                "type": "object",
+                "description": "Worker definitions; only 'pi' and 'agy' exist. At least one is required.",
+                "additionalProperties": false,
+                "properties": {
+                    "pi":  { "$ref": "#/$defs/PiWorker" },
+                    "agy": { "$ref": "#/$defs/AgyWorker" }
                 }
             },
-            "workflow": {
-                "description": "Array of workflow definitions (TOML: [[workflow]]).",
-                "type": "array",
-                "items": {
-                    "$ref": "#/$defs/WorkflowConfig"
-                }
+            "ladder": {
+                "type": "object",
+                "description": "[ladder.NAME] escalation ladders.",
+                "additionalProperties": { "$ref": "#/$defs/Ladder" }
+            },
+            "check": {
+                "type": "object",
+                "description": "[check.NAME] jailed verification commands.",
+                "additionalProperties": { "$ref": "#/$defs/Check" }
             }
         },
-        "additionalProperties": false,
 
         "$defs": {
-            "BackendConfig": {
-                "title": "BackendConfig",
-                "description": "A single backend (LLM endpoint or local CLI agent).",
+            "Paths": {
                 "type": "object",
-                "required": ["name", "type"],
+                "additionalProperties": false,
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Unique identifier for this backend, referenced by workflows."
-                    },
-                    "type": {
-                        "type": "string",
-                        "enum": ["stdio-cli"],
-                        "description": "Selects the backend driver (only 'stdio-cli')."
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "default": 60,
-                        "description": "Per-request timeout in seconds."
-                    },
-                    "command": {
-                        "type": "string",
-                        "description": "[stdio-cli] Executable to invoke (e.g. 'hermes')."
-                    },
-                    "args": {
+                    "wt_roots": {
                         "type": "array",
+                        "minItems": 1,
                         "items": { "type": "string" },
-                        "default": [],
-                        "description": "[stdio-cli] Argument list. The literal token '{prompt}' is replaced with the user message at call time."
+                        "default": ["~/Documents/echomeo-wt", "~/Documents/otter-wt"],
+                        "description": "Worktree roots; absolute or starting with '~'."
+                    },
+                    "state_dir": {
+                        "type": "string",
+                        "description": "Leases, cooldown.json, ledger.jsonl, tasks/<id>/. Default: ${XDG_STATE_HOME:-~/.local/state}/weir."
+                    },
+                    "scratch": {
+                        "type": "string",
+                        "default": "/tmp/pilot",
+                        "description": "Scratch directory; must not be empty."
                     }
                 }
             },
-
-            "WorkflowConfig": {
-                "title": "WorkflowConfig",
-                "description": "A named orchestration workflow.",
+            "Slot": {
                 "type": "object",
-                "required": ["name", "pattern"],
+                "required": ["capacity"],
+                "additionalProperties": false,
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Unique workflow identifier."
+                    "capacity": { "type": "integer", "minimum": 1 }
+                }
+            },
+            "PiWorker": {
+                "type": "object",
+                "required": ["timeout"],
+                "additionalProperties": false,
+                "properties": {
+                    "command": { "type": "string", "default": "pi-worker", "description": "Bare wrapper name on PATH; only 'pi-worker' is allowed." },
+                    "replica_args": { "type": "array", "items": { "type": "string" }, "default": ["-b", "{replica}"] },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Wall-clock seconds." },
+                    "slots": {
+                        "type": "object",
+                        "description": "Replica key (a|b) to slot name.",
+                        "additionalProperties": false,
+                        "properties": {
+                            "a": { "type": "string" },
+                            "b": { "type": "string" }
+                        }
+                    }
+                }
+            },
+            "AgyWorker": {
+                "type": "object",
+                "required": ["timeout"],
+                "additionalProperties": false,
+                "properties": {
+                    "command": { "type": "string", "default": "agy-worker", "description": "Bare wrapper name on PATH; only 'agy-worker' is allowed." },
+                    "model_args": { "type": "array", "items": { "type": "string" }, "default": ["-m", "{model}"] },
+                    "default_model": { "type": "string" },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Wall-clock seconds." },
+                    "slots": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": { "any": { "type": "string" } }
                     },
-                    "pattern": {
-                        "type": "string",
-                        "enum": ["fan-out", "pipeline", "router", "eval-loop"],
-                        "description": "Orchestration pattern that drives execution."
-                    },
-                    "backends": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "[fan-out / router] List of backend names to dispatch to."
-                    },
-                    "aggregation": {
-                        "type": "string",
-                        "enum": ["all", "first", "majority"],
-                        "description": "[fan-out] Strategy for combining responses from multiple backends."
-                    },
+                    "quota_pattern": { "type": "string", "default": "RESOURCE_EXHAUSTED", "description": "Non-empty stderr marker for a quota failure." },
+                    "quota_cooldown": { "type": "string", "default": "30m", "pattern": "^[0-9]+[smhd]$", "description": "Integer plus unit s|m|h|d, greater than zero." }
+                }
+            },
+            "Ladder": {
+                "type": "object",
+                "required": ["steps"],
+                "additionalProperties": false,
+                "properties": {
                     "steps": {
                         "type": "array",
-                        "items": { "$ref": "#/$defs/PipelineStep" },
-                        "description": "[pipeline] Ordered list of processing steps."
+                        "minItems": 1,
+                        "items": { "type": "string", "pattern": "^(pi|agy):.+$" },
+                        "description": "Each step is '<worker>:<arg>'; pi args: auto|a|b; agy args: a model id."
                     },
-                    "generator": {
-                        "type": "string",
-                        "description": "[eval-loop] Backend name used for generation."
-                    },
-                    "evaluator": {
-                        "type": "string",
-                        "description": "[eval-loop] Backend name used for evaluation / critique."
-                    },
-                    "max_iterations": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "[eval-loop] Maximum number of generate→evaluate cycles before giving up."
-                    }
+                    "fresh_worktree_per_step": { "type": "boolean", "default": true }
                 }
             },
-
-            "PipelineStep": {
-                "title": "PipelineStep",
-                "description": "A single step inside a 'pipeline' workflow.",
+            "Check": {
                 "type": "object",
-                "required": ["backend"],
+                "required": ["cmd", "timeout"],
+                "additionalProperties": false,
                 "properties": {
-                    "backend": {
-                        "type": "string",
-                        "description": "Name of the backend to invoke for this step."
-                    },
-                    "role": {
-                        "type": "string",
-                        "description": "Optional semantic role label (e.g. 'summarizer', 'translator')."
-                    },
-                    "prompt_template": {
-                        "type": "string",
-                        "description": "Optional Handlebars/mustache-style template. Use '{{step.output}}' to inject the previous step's output."
-                    }
-                },
-                "additionalProperties": false
+                    "cwd": { "type": "string", "description": "Relative path inside the worktree; no '..'." },
+                    "cmd": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                    "timeout": { "type": "integer", "minimum": 1, "description": "Seconds." }
+                }
             }
         }
     })

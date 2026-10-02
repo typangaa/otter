@@ -8,7 +8,7 @@
 //!
 //! **There is deliberately no fallback to `./weir.toml`.** A repo-controlled
 //! file must never decide which binaries weir executes; a clone containing
-//! `weir.toml` would otherwise point `weir chat` at an attacker-chosen
+//! `weir.toml` would otherwise point `weir task run` at an attacker-chosen
 //! wrapper. When nothing is found the error lists every path considered.
 
 use std::ffi::OsStr;

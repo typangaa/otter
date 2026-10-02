@@ -2,9 +2,8 @@
 //!
 //! This module defines the v2 TOML schema with strict parsing
 //! (`deny_unknown_fields` on every struct), validation, path expansion and
-//! small helpers (`config_version`, `load_any`, `parse_duration`). The legacy
-//! v0.5 [`Config`] stays untouched; [`load_any`] dispatches on the top-level
-//! `version` key.
+//! small helpers (`config_version`, `parse_duration`). [`ConfigV2::load`]
+//! dispatches on the top-level `version` key and rejects pre-v2 files.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -13,8 +12,6 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::{Result, WeirError};
-
-use super::Config;
 
 /// The only worker commands weir is allowed to exec (hard-coded; no regex crate).
 pub const ALLOWED_WORKER_COMMANDS: [&str; 2] = ["pi-worker", "agy-worker"];
@@ -110,18 +107,13 @@ impl Workers {
         v
     }
 
-    fn get(&self, name: &str) -> Option<WorkerRef<'_>> {
+    fn is_defined(&self, name: &str) -> bool {
         match name {
-            "pi" => self.pi.as_ref().map(WorkerRef::Pi),
-            "agy" => self.agy.as_ref().map(WorkerRef::Agy),
-            _ => None,
+            "pi" => self.pi.is_some(),
+            "agy" => self.agy.is_some(),
+            _ => false,
         }
     }
-}
-
-enum WorkerRef<'a> {
-    Pi(&'a PiWorker),
-    Agy(&'a AgyWorker),
 }
 
 /// `[worker.pi]`
@@ -206,10 +198,29 @@ impl ConfigV2 {
         toml::from_str(text).map_err(|e| WeirError::Config(format!("parse v2 config: {e}")))
     }
 
-    /// Read a file, parse and validate it.
+    /// Read a file, check its `version` key, parse and validate it.
+    ///
+    /// A file without `version = 2` (the retired v0.5 schema) is rejected with
+    /// a message pointing at the migration example.
     pub fn load(path: &Path) -> Result<ConfigV2> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| WeirError::Config(format!("cannot read {}: {e}", path.display())))?;
+        match config_version(&text)? {
+            None => {
+                return Err(WeirError::Config(format!(
+                    "{}: missing 'version = 2'. Only the v2 config schema is supported; \
+                     migrate the file (see examples/weir.v2.example.toml)",
+                    path.display()
+                )))
+            }
+            Some(2) => {}
+            Some(n) => {
+                return Err(WeirError::Config(format!(
+                    "unsupported config version {n}; expected version = 2 \
+                     (see examples/weir.v2.example.toml)"
+                )))
+            }
+        }
         let cfg = Self::parse(&text)?;
         cfg.validate()?;
         Ok(cfg)
@@ -362,7 +373,9 @@ impl ConfigV2 {
         }
     }
 
-    /// `paths.scratch` with `~` expanded.
+    /// `paths.scratch` with `~` expanded. Reserved for the scratch mode; not
+    /// consumed by any v1 command yet.
+    #[allow(dead_code)]
     pub fn scratch_expanded(&self) -> Result<PathBuf> {
         match &self.paths.scratch {
             Some(s) => expand_tilde(s),
@@ -448,7 +461,7 @@ fn validate_ladder_step(name: &str, step: &str, workers: &Workers) -> Result<()>
             "[ladder.{name}] step {step:?} references unknown worker {worker:?} (must be pi or agy)"
         )));
     }
-    if workers.get(worker).is_none() {
+    if !workers.is_defined(worker) {
         return Err(WeirError::Validation(format!(
             "[ladder.{name}] step {step:?} references worker {worker:?} which is not defined under [worker.*]"
         )));
@@ -485,7 +498,7 @@ fn validate_relative_cwd(name: &str, cwd: &str) -> Result<()> {
 // ── version dispatch ──────────────────────────────────────────────────────────
 
 /// Read the top-level integer `version` key. `None` means the key is absent
-/// (legacy v0.5 file). Error if present but not an integer.
+/// (pre-v2 file). Error if present but not an integer.
 pub fn config_version(text: &str) -> Result<Option<i64>> {
     let table: toml::Table =
         toml::from_str(text).map_err(|e| WeirError::Config(format!("parse config: {e}")))?;
@@ -495,26 +508,6 @@ pub fn config_version(text: &str) -> Result<Option<i64>> {
         Some(other) => Err(WeirError::Config(format!(
             "config 'version' key must be an integer, got {other}"
         ))),
-    }
-}
-
-/// A config file in either the legacy (v0.5) or v2 schema.
-#[derive(Debug, Clone)]
-pub enum AnyConfig {
-    /// Legacy v0.5 file (no `version` key) — loaded unchanged.
-    Legacy(Box<Config>),
-    /// `version = 2` file.
-    V2(Box<ConfigV2>),
-}
-
-/// Load a config file, dispatching on its `version` key.
-pub fn load_any(path: &Path) -> Result<AnyConfig> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| WeirError::Config(format!("cannot read {}: {e}", path.display())))?;
-    match config_version(&text)? {
-        None => Ok(AnyConfig::Legacy(Box::new(Config::load(path)?))),
-        Some(2) => Ok(AnyConfig::V2(Box::new(ConfigV2::load(path)?))),
-        Some(n) => Err(WeirError::Config(format!("unsupported config version {n}"))),
     }
 }
 
@@ -670,32 +663,34 @@ timeout = 3600
     }
 
     #[test]
-    fn legacy_file_without_version() {
+    fn legacy_file_without_version_is_rejected() {
         let legacy = r#"
 [[backend]]
 name = "echo"
 type = "stdio-cli"
 command = "cat"
-timeout_secs = 60
 "#;
         assert_eq!(config_version(legacy).unwrap(), None);
         let f = write_tmp(legacy);
-        match load_any(f.path()).unwrap() {
-            AnyConfig::Legacy(c) => assert_eq!(c.backends.len(), 1),
-            AnyConfig::V2(_) => panic!("expected Legacy"),
+        match ConfigV2::load(f.path()) {
+            Err(WeirError::Config(m)) => {
+                assert!(m.contains("version = 2"), "{m}");
+                assert!(m.contains("examples/weir.v2.example.toml"), "{m}");
+            }
+            other => panic!("expected Config error, got {other:?}"),
         }
     }
 
     #[test]
-    fn v2_file_loads_via_load_any() {
+    fn v2_file_loads() {
         let f = write_tmp(MINIMAL);
-        assert!(matches!(load_any(f.path()).unwrap(), AnyConfig::V2(_)));
+        assert!(ConfigV2::load(f.path()).is_ok());
     }
 
     #[test]
-    fn version_3_rejected_by_load_any() {
+    fn version_3_rejected_by_load() {
         let f = write_tmp("version = 3\n");
-        match load_any(f.path()) {
+        match ConfigV2::load(f.path()) {
             Err(WeirError::Config(m)) => assert!(m.contains("unsupported config version 3"), "{m}"),
             other => panic!("expected Config error, got {other:?}"),
         }
