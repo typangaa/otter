@@ -7,21 +7,6 @@ pub enum WeirError {
     #[error("config error: {0}")]
     Config(String),
 
-    #[error("backend '{0}' not found")]
-    BackendNotFound(String),
-
-    #[error("backend error: {0}")]
-    Backend(String),
-
-    #[error("circuit open: {0}")]
-    CircuitOpen(String),
-
-    #[error("rate limited: {0}")]
-    RateLimited(String),
-
-    #[error("workflow '{0}' not found")]
-    WorkflowNotFound(String),
-
     #[error("validation failed: {0}")]
     Validation(String),
 

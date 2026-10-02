@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 
-use crate::config::v2::{load_any, parse_duration, AnyConfig, ConfigV2};
+use crate::config::v2::{parse_duration, ConfigV2};
 use crate::task::git;
 use crate::task::id;
 use crate::task::ledger::{self, TaskRecord};
@@ -209,14 +209,7 @@ pub fn load_v2(cfg_path: &Path) -> Result<ConfigV2, String> {
     if !cfg_path.is_file() {
         return Err(format!("config file not found: {}", cfg_path.display()));
     }
-    match load_any(cfg_path) {
-        Ok(AnyConfig::V2(cfg)) => Ok(*cfg),
-        Ok(AnyConfig::Legacy(_)) => Err(format!(
-            "task requires a version = 2 config ({})",
-            cfg_path.display()
-        )),
-        Err(e) => Err(e.to_string()),
-    }
+    ConfigV2::load(cfg_path).map_err(|e| e.to_string())
 }
 
 /// Validate an id that names a path component (`tasks/<id>`, `wt/<id>`).

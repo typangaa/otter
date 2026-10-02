@@ -34,7 +34,7 @@ fn weir_in(cwd: &Path) -> Command {
     }
     cmd.env("HOME", cwd.join("home"));
     cmd.env("XDG_CONFIG_HOME", cwd.join("home/.config"));
-    // Never let a test write metrics into the developer's real state dir.
+    // Never let a test write leases, ledger or cooldowns into the developer's real state dir.
     cmd.env("XDG_STATE_HOME", cwd.join("state"));
     cmd
 }
@@ -217,13 +217,7 @@ fn config_consuming_commands_fail_with_2_without_a_config() {
     let cwd = tmp.path();
     write(&cwd.join("weir.toml"), LEGACY_CONFIG);
 
-    for args in [
-        vec!["validate"],
-        vec!["backend", "list"],
-        vec!["workflow", "list"],
-        vec!["status"],
-        vec!["chat", "echoer", "hi"],
-    ] {
+    for args in [vec!["validate"], vec!["status"]] {
         let out = weir_in(cwd).args(&args).output().unwrap();
         assert_eq!(
             out.status.code(),
@@ -301,7 +295,7 @@ fn lease_version_and_schema_work_without_any_config() {
 // ── validate: legacy and v2 ───────────────────────────────────────────────────
 
 #[test]
-fn validate_legacy_config_still_reports_backends_and_workflows() {
+fn validate_legacy_config_is_rejected_with_migration_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let cfg = cwd.join("legacy.toml");
@@ -313,11 +307,11 @@ fn validate_legacy_config_still_reports_backends_and_workflows() {
         .arg("validate")
         .output()
         .unwrap();
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Config valid:") && stdout.contains("1 backend(s)"),
-        "{stdout}"
+        stderr.contains("version = 2") && stderr.contains("examples/weir.v2.example.toml"),
+        "{stderr}"
     );
 }
 
@@ -725,7 +719,7 @@ fn deep_fails_when_agent_jail_has_no_wt_roots_array() {
 }
 
 #[test]
-fn deep_on_legacy_config_is_a_usage_error() {
+fn deep_on_legacy_config_is_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path();
     let cfg = cwd.join("legacy.toml");
@@ -738,9 +732,9 @@ fn deep_on_legacy_config_is_a_usage_error() {
         .arg("--deep")
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--deep requires a version = 2 config"),
+        String::from_utf8_lossy(&out.stderr).contains("missing 'version = 2'"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -752,10 +746,10 @@ fn deep_on_legacy_config_is_a_usage_error() {
         .args(["--json", "validate", "--deep"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["status"], "error");
-    assert!(v["error"].as_str().unwrap().contains("--deep requires"));
+    assert!(v["error"].as_str().unwrap().contains("version = 2"));
 }
 
 #[test]
